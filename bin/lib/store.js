@@ -71,6 +71,13 @@ function nextId(records) {
   return "m" + String(n + 1).padStart(4, "0");
 }
 
+/** Archived records, kept readable so pruning never destroys knowledge. */
+function readArchive(file) {
+  const archive = file + ".archive";
+  if (!fs.existsSync(archive)) return [];
+  return readStore(archive);
+}
+
 /** Apply edit/del ops in file order. Live facts come back in original insertion order. */
 function resolve(records) {
   const byId = new Map();
@@ -138,4 +145,4 @@ function slugTopic(t) {
     .slice(0, LIMITS.topic);
 }
 
-module.exports = { LIMITS, TOKEN_RE, OPS, readStore, validate, nextId, resolve, rank, tokens, slugTopic };
+module.exports = { LIMITS, TOKEN_RE, OPS, readStore, readArchive, validate, nextId, resolve, rank, tokens, slugTopic };

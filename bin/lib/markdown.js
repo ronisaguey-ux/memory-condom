@@ -163,4 +163,27 @@ function mergeFragments(records) {
   return { records: out, joined };
 }
 
-module.exports = { importMarkdown, renderMarkdown, mergeFragments, slug, splitSentences, hardSplit };
+/** Byte-stable size estimate. DeepSeek tokenises markdown at roughly 3.6 bytes/token. */
+function estimateTokens(bytes) {
+  return Math.ceil(bytes / 3.6);
+}
+
+function renderTokens(file) {
+  return estimateTokens(Buffer.byteLength(renderMarkdown(file), "utf8"));
+}
+
+function budget() {
+  return parseInt(process.env.MEMCONDOM_MAX_TOKENS || "12000", 10);
+}
+
+module.exports = {
+  importMarkdown,
+  renderMarkdown,
+  mergeFragments,
+  slug,
+  splitSentences,
+  hardSplit,
+  estimateTokens,
+  renderTokens,
+  budget,
+};
