@@ -173,7 +173,7 @@ function renderTokens(file) {
 }
 
 function budget() {
-  return parseInt(process.env.MEMCONDOM_MAX_TOKENS || "12000", 10);
+  return parseInt(process.env.MEMCONDOM_MAX_TOKENS || "25000", 10);
 }
 
 module.exports = {
