@@ -12,8 +12,10 @@
 "use strict";
 
 const fs = require("fs");
+const path = require("path");
 const { LIMITS, readStore, validate, nextId, resolve, rank } = require("./lib/store.js");
 const { importMarkdown, renderMarkdown, mergeFragments } = require("./lib/markdown.js");
+const { guardAll, guardDir, writeLocked } = require("./lib/guard.js");
 
 process.stdout.on("error", () => {});
 
@@ -115,8 +117,26 @@ function cmdImport(argv) {
 function cmdRender(argv) {
   const args = parseArgs(argv);
   const text = renderMarkdown(args.file || "AGENTS.jsonl");
-  if (args.out) fs.writeFileSync(args.out, text);
+  if (args.out) writeLocked(args.out, text, { lock: Boolean(args.lock) });
   else process.stdout.write(text);
+}
+
+function cmdGuard(argv) {
+  const args = parseArgs(argv);
+  const dirs = (args._ || []).concat(args.dir ? String(args.dir).split(",") : []);
+  const single = dirs.length === 1 && fs.existsSync(path.join(dirs[0], "AGENTS.jsonl"));
+  const results = single
+    ? [guardDir(dirs[0], { dryRun: Boolean(args.dryRun), lock: !args.unlock })]
+    : guardAll(dirs, { dryRun: Boolean(args.dryRun), lock: !args.unlock });
+  for (const r of results) {
+    if (r.status === "ok" && !args.verbose) continue;
+    process.stdout.write(
+      `${r.dir}\t${r.status}\textra=${r.repaired}${r.archived ? `\tarchived=${path.basename(r.archived)}` : ""}\n`
+    );
+  }
+  const bad = results.filter((r) => r.status !== "ok").length;
+  process.stdout.write(`${results.length} stores, ${bad} repaired\n`);
+  process.exit(bad && args.strict ? 1 : 0);
 }
 
 function cmdPrune(argv) {
@@ -180,7 +200,7 @@ function parseArgs(argv) {
 
 function usage() {
   return (
-    "memory-condom <add|edit|del|search|check|import|render|prune|stats|merge>\n" +
+    "memory-condom <add|edit|del|search|check|import|render|prune|stats|merge|guard>\n" +
     '  add    --topic T --text S [--tags a,b] [--refs m0001,m0002] [--file AGENTS.jsonl]\n' +
     '  edit   --ref m0007 --text "corrected fact" [--topic T]\n' +
     '  del    --ref m0007 [--reason "why"]\n' +
@@ -190,7 +210,8 @@ function usage() {
     "  render [--file AGENTS.jsonl] [--out AGENTS.md]\n" +
     "  prune  --max N [--file AGENTS.jsonl]\n" +
     "  stats  [--file AGENTS.jsonl]\n" +
-    "  merge  [--file AGENTS.jsonl]\n"
+    "  merge  [--file AGENTS.jsonl]\n" +
+    "  guard  [dir ...] [--verbose] [--strict] [--unlock]  keep AGENTS.md == store, archiving any drift\n"
   );
 }
 
@@ -205,6 +226,7 @@ const commands = {
   prune: cmdPrune,
   stats: cmdStats,
   merge: cmdMerge,
+  guard: cmdGuard,
 };
 
 if (require.main === module) {
