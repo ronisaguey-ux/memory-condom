@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "memory-condom record",
+  "type": "object",
+  "required": ["id", "topic", "text"],
+  "additionalProperties": true,
+  "properties": {
+    "id": { "type": "string", "pattern": "^m[0-9]+$" },
+    "ts": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+    "topic": { "type": "string", "pattern": "^[a-z0-9][a-z0-9/._-]*$", "maxLength": 40 },
+    "text": { "type": "string", "maxLength": 400, "pattern": "^[^\n\r]*$" },
+    "tags": { "type": "array", "items": { "type": "string", "maxLength": 20 }, "maxItems": 6 }
+  }
+}
