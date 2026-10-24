@@ -1,0 +1,8 @@
+{
+  "name": "memory-condom",
+  "version": "0.1.0",
+  "description": "Append-only one-line memory store for agent instructions: keeps the prompt cache warm and the instruction file terse.",
+  "bin": { "memcondom": "bin/memcondom.js" },
+  "license": "MIT",
+  "type": "commonjs"
+}
