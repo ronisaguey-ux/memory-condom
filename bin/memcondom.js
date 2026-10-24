@@ -13,8 +13,8 @@
 
 const fs = require("fs");
 const path = require("path");
-const { LIMITS, readStore, validate, nextId, resolve, rank } = require("./lib/store.js");
-const { importMarkdown, renderMarkdown, mergeFragments } = require("./lib/markdown.js");
+const { LIMITS, readStore, readArchive, validate, nextId, resolve, rank } = require("./lib/store.js");
+const { importMarkdown, renderMarkdown, mergeFragments, renderTokens, budget } = require("./lib/markdown.js");
 const { guardAll, guardDir, writeLocked } = require("./lib/guard.js");
 
 process.stdout.on("error", () => {});
@@ -40,8 +40,18 @@ function cmdAdd(argv) {
   if (args.refs) rec.refs = String(args.refs).split(",").map((s) => s.trim()).filter(Boolean);
   const errs = validate(rec, new Set(records.map((r) => r.id)));
   if (errs.length) die(`refused to append:\n  - ${errs.join("\n  - ")}`);
+  const cap = budget();
+  const current = renderTokens(file);
+  const addition = Math.ceil((String(rec.text).length + String(rec.topic).length + 24) / 3.6);
+  if (current + addition > cap)
+    die(
+      `refused: store is ~${current} tokens, cap ${cap}. Adding this fact would exceed it.\n` +
+        `  Fix one of two ways:\n` +
+        `    memcondom prune --max-tokens ${cap} --file ${file}   (oldest goes first, archived not lost)\n` +
+        `    or write the detail as an artifact instead of a memory`
+    );
   append(file, rec);
-  process.stdout.write(`appended ${rec.id} (${records.length + 1} lines)\n`);
+  process.stdout.write(`appended ${rec.id} (${records.length + 1} lines, ~${current + addition}/${cap} tokens)\n`);
 }
 
 function cmdEdit(argv) {
@@ -74,10 +84,16 @@ function cmdSearch(argv) {
   const args = parseArgs(argv);
   const query = (args._ || []).join(" ").trim();
   if (!query) die("usage: memcondom search <words> [--limit 10]");
-  const hits = rank(resolve(readStore(args.file || "AGENTS.jsonl")), query).slice(0, parseInt(args.limit || "10", 10));
+  const file = args.file || "AGENTS.jsonl";
+  const live = resolve(readStore(file)).map((r) => ({ ...r }));
+  const archived = resolve(readArchive(file)).map((r) => ({ ...r, archived: true }));
+  const seenIds = new Set(live.map((r) => r.id));
+  const hits = rank([...live, ...archived.filter((r) => !seenIds.has(r.id))], query).slice(0, parseInt(args.limit || "10", 10));
   if (!hits.length) return process.stdout.write("no matches\n");
   for (const { rec, score } of hits)
-    process.stdout.write(`${rec.id}\t${score.toFixed(1)}\t${rec.topic}\t${rec.text.slice(0, 160)}\n`);
+    process.stdout.write(
+      `${rec.id}\t${score.toFixed(1)}\t${rec.topic}${rec.archived ? "\t[archived]" : ""}\t${rec.text.slice(0, 160)}\n`
+    );
 }
 
 function cmdCheck(argv) {
@@ -139,22 +155,71 @@ function cmdGuard(argv) {
   process.exit(bad && args.strict ? 1 : 0);
 }
 
+const PINNED_TOPICS = new Set(["memory-condom", "diaries", "keys"]);
+
+/** Priority lists live next to the store so each agent can protect what it must never forget. */
+function protectedPrefixes(file) {
+  const candidates = [
+    process.env.MEMCONDOM_PRIORITY,
+    path.join(path.dirname(path.resolve(file)), "memory-priority.json"),
+  ].filter(Boolean);
+  for (const c of candidates) {
+    try {
+      const doc = JSON.parse(fs.readFileSync(c, "utf8"));
+      if (Array.isArray(doc.protect_prefixes)) return doc.protect_prefixes;
+    } catch {
+      /* fall through to the default */
+    }
+  }
+  return ["0-", "1-", "memory-condom", "diaries", "keys"];
+}
+
 function cmdPrune(argv) {
-  // Occasional and explicit: never part of the normal write path.
+  // Explicit and rare. Two modes: --max <records> or --max-tokens <n> (the one that matters).
+  // Oldest goes first, except operating rules: dropping those would make an agent forget how to
+  // write memory at all. Everything removed is appended to <store>.archive and stays searchable.
   const args = parseArgs(argv);
   const file = args.file || "AGENTS.jsonl";
-  const max = parseInt(args.max || "0", 10);
-  if (!max) die("usage: memcondom prune --max <n> [--archive AGENTS.jsonl.archive]");
+  const maxRecords = parseInt(args.max || "0", 10);
+  const maxTokens = parseInt(args["max-tokens"] || "0", 10);
+  if (!maxRecords && !maxTokens) die("usage: memcondom prune --max-tokens 12000 [--file AGENTS.jsonl]");
+
   const records = readStore(file);
   const live = resolve(records);
-  if (live.length <= max) return process.stdout.write(`nothing to prune (${live.length} live <= ${max})\n`);
-  const keepIds = new Set(live.slice(live.length - max).map((r) => r.id));
-  const keep = records.filter((r) => (OPS.has(r.op) ? keepIds.has(r.ref) : keepIds.has(r.id)));
+  const prefixes = protectedPrefixes(file);
+  const pinned = (r) =>
+    PINNED_TOPICS.has(r.topic) ||
+    (r.tags || []).includes("pin") ||
+    prefixes.some((p) => String(r.topic || "").startsWith(p));
+  const pinnedIds = new Set(live.filter(pinned).map((r) => r.id));
+  const droppable = live.filter((r) => !pinnedIds.has(r.id)); // oldest first
+
+  const kept = new Set(pinnedIds);
+  if (maxTokens) {
+    // Walk newest-first, admitting records until the rendered file would exceed the budget.
+    const charsOf = (r) => (r.text || "").length + (r.topic || "").length + 24;
+    let used = live.filter(pinned).reduce((n, r) => n + charsOf(r), 0);
+    for (let i = droppable.length - 1; i >= 0; i--) {
+      const r = droppable[i];
+      if (used + charsOf(r) > maxTokens * 3.6) continue;
+      used += charsOf(r);
+      kept.add(r.id);
+    }
+  } else {
+    for (const r of live.slice(live.length - maxRecords)) kept.add(r.id);
+    for (const id of pinnedIds) kept.add(id);
+  }
+
+  const keep = records.filter((r) => (OPS.has(r.op) ? kept.has(r.ref) : kept.has(r.id)));
   const drop = records.filter((r) => !keep.includes(r));
+  if (!drop.length) return process.stdout.write(`nothing to prune (${live.length} live, ~${renderTokens(file)} tokens)\n`);
+
   const archive = args.archive || file + ".archive";
   fs.appendFileSync(archive, drop.map((r) => JSON.stringify(r)).join("\n") + "\n");
   fs.writeFileSync(file, keep.map((r) => JSON.stringify(r)).join("\n") + "\n");
-  process.stdout.write(`archived ${drop.length} lines, kept ${keep.length} (archive: ${archive})\n`);
+  process.stdout.write(
+    `archived ${drop.length} lines, kept ${keep.length} records, now ~${renderTokens(file)} tokens (cap ${maxTokens || "-"})\n`
+  );
 }
 
 function cmdStats(argv) {
@@ -208,7 +273,7 @@ function usage() {
     "  check  [--file AGENTS.jsonl]\n" +
     "  import <file.md> [--out AGENTS.jsonl] [--force]\n" +
     "  render [--file AGENTS.jsonl] [--out AGENTS.md]\n" +
-    "  prune  --max N [--file AGENTS.jsonl]\n" +
+    "  prune  --max-tokens 12000 | --max N [--file AGENTS.jsonl]\n" +
     "  stats  [--file AGENTS.jsonl]\n" +
     "  merge  [--file AGENTS.jsonl]\n" +
     "  guard  [dir ...] [--verbose] [--strict] [--unlock]  keep AGENTS.md == store, archiving any drift\n"

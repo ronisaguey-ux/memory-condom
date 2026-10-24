@@ -26,7 +26,8 @@ const os = require("os");
 const path = require("path");
 
 const artifacts = require("./artifacts.js");
-const { readStore, resolve, validate, nextId, rank, LIMITS, slugTopic } = require("./lib/store.js");
+const { readStore, readArchive, resolve, validate, nextId, rank, LIMITS, slugTopic } = require("./lib/store.js");
+const { renderTokens, budget } = require("./lib/markdown.js");
 
 function storePath() {
   if (process.env.MEMCONDOM_FILE) return process.env.MEMCONDOM_FILE;
@@ -48,8 +49,17 @@ function writeMemory(args) {
   if (Array.isArray(args.refs) && args.refs.length) rec.refs = args.refs.map(String).slice(0, 12);
   const errs = validate(rec, new Set(records.map((r) => r.id)));
   if (errs.length) throw new Error(`refused: ${errs.join("; ")}`);
+  const cap = budget();
+  const current = renderTokens(file);
+  const addition = Math.ceil((String(rec.text).length + String(rec.topic).length + 24) / 3.6);
+  if (current + addition > cap)
+    throw new Error(
+      `memory store is full: ~${current}/${cap} tokens. Either prune old memories ` +
+        `(memcondom prune --max-tokens ${cap} --file ${file}) or write this as an artifact with write_artifact. ` +
+        `Nothing was appended.`
+    );
   fs.appendFileSync(file, JSON.stringify(rec) + "\n");
-  return `appended ${rec.id} (${records.length + 1} lines) — run \`memcondom render\` to refresh the injected markdown`;
+  return `appended ${rec.id} (${records.length + 1} lines, ~${current + addition}/${cap} tokens)`;
 }
 
 function editMemory(args) {
@@ -89,9 +99,17 @@ function searchMemory(args) {
   const query = String(args.query || "").trim();
   if (!query) throw new Error("query required");
   const limit = Math.max(1, Math.min(Number(args.limit) || 10, 50));
-  const hits = rank(resolve(readStore(storePath())), query).slice(0, limit);
+  const file = storePath();
+  const live = resolve(readStore(file));
+  const liveIds = new Set(live.map((r) => r.id));
+  const archived = resolve(readArchive(file))
+    .filter((r) => !liveIds.has(r.id))
+    .map((r) => ({ ...r, archived: true }));
+  const hits = rank([...live, ...archived], query).slice(0, limit);
   return hits.length
-    ? hits.map(({ rec, score }) => `${rec.id}\t${score.toFixed(1)}\t${rec.topic}\t${rec.text}`).join("\n")
+    ? hits.map(({ rec, score }) =>
+        `${rec.id}\t${score.toFixed(1)}\t${rec.topic}${rec.archived ? "\t[archived]" : ""}\t${rec.text}`
+      ).join("\n")
     : "no matches";
 }
 
@@ -113,7 +131,7 @@ const TOOLS = [
   {
     name: "write_memory",
     description:
-      "Append ONE terse verified fact to the agent memory store (AGENTS.jsonl). Append-only: never rewrite or reorder existing lines — the injected prompt prefix must stay byte-identical for the provider's cache. Max 400 chars, no newlines, one fact per call.",
+      "Append ONE terse verified fact to the agent memory store (AGENTS.jsonl). Append-only: never rewrite or reorder existing lines — the injected prompt prefix must stay byte-identical for the provider's cache. Max 400 chars, no newlines, one fact per call. The store has a hard token budget: if the write pushes it over, prune old memories or put the detail in an artifact instead.",
     inputSchema: {
       type: "object",
       properties: {
