@@ -28,6 +28,21 @@ const path = require("path");
 const artifacts = require("./artifacts.js");
 const { readStore, readArchive, resolve, validate, nextId, rank, LIMITS, slugTopic } = require("./lib/store.js");
 const { renderTokens, budget } = require("./lib/markdown.js");
+const { checkAndUseEdit, LOCKED_MESSAGE } = require("./lib/memory_window.js");
+
+function currentSessionId(targetDir) {
+  if (process.env.OPENCODE_SESSION_ID) return process.env.OPENCODE_SESSION_ID;
+  if (process.env.OC2_SESSION) return process.env.OC2_SESSION;
+  const pin = path.join(targetDir, "state", "session_id");
+  if (fs.existsSync(pin)) {
+    try { return fs.readFileSync(pin, "utf8").trim().split("\n")[0].trim(); } catch {}
+  }
+  const openbot = path.join(os.homedir(), ".local/state/opencode/openbot_session");
+  if (fs.existsSync(openbot)) {
+    try { return fs.readFileSync(openbot, "utf8").trim().split("\n")[0].trim(); } catch {}
+  }
+  return "unknown_session";
+}
 
 function storePath() {
   if (process.env.MEMCONDOM_FILE) return process.env.MEMCONDOM_FILE;
@@ -42,6 +57,10 @@ function today() {
 
 function writeMemory(args) {
   const file = storePath();
+  const targetDir = path.dirname(file);
+  const sid = currentSessionId(targetDir);
+  const gate = checkAndUseEdit(targetDir, sid, file);
+  if (!gate.allowed) throw new Error(gate.message || LOCKED_MESSAGE);
   const records = readStore(file);
   const text = String(args.text || "").replace(/\s+/g, " ").trim();
   const rec = { id: nextId(records), ts: today(), topic: slugTopic(args.topic), text };
@@ -64,6 +83,10 @@ function writeMemory(args) {
 
 function editMemory(args) {
   const file = storePath();
+  const targetDir = path.dirname(file);
+  const sid = currentSessionId(targetDir);
+  const gate = checkAndUseEdit(targetDir, sid, file);
+  if (!gate.allowed) throw new Error(gate.message || LOCKED_MESSAGE);
   const records = readStore(file);
   const ref = String(args.id || args.ref || "");
   if (!records.some((r) => r.id === ref && !r.op)) throw new Error(`no record ${ref}`);
@@ -77,6 +100,10 @@ function editMemory(args) {
 
 function deleteMemory(args) {
   const file = storePath();
+  const targetDir = path.dirname(file);
+  const sid = currentSessionId(targetDir);
+  const gate = checkAndUseEdit(targetDir, sid, file);
+  if (!gate.allowed) throw new Error(gate.message || LOCKED_MESSAGE);
   const records = readStore(file);
   const ref = String(args.id || args.ref || "");
   if (!records.some((r) => r.id === ref && !r.op)) throw new Error(`no record ${ref}`);
