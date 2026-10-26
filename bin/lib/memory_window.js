@@ -25,6 +25,8 @@ function defaultState() {
     last_compaction_id: null,
     current_turn: 0,
     bypass_count: 0,
+    admin_override_count: 0,
+    is_admin_override: false,
   };
 }
 
@@ -77,6 +79,8 @@ function readState(targetDir) {
       last_compaction_id: parsed.last_compaction_id ?? null,
       current_turn: Number(parsed.current_turn || 0),
       bypass_count: Number(parsed.bypass_count || 0),
+      admin_override_count: Number(parsed.admin_override_count || 0),
+      is_admin_override: Boolean(parsed.is_admin_override),
     };
   } catch (_) {
     // Missing or corrupt state defaults to locked
@@ -97,6 +101,8 @@ function writeState(targetDir, state) {
       last_compaction_id: state.last_compaction_id,
       current_turn: state.current_turn,
       bypass_count: state.bypass_count || 0,
+      admin_override_count: state.admin_override_count || 0,
+      is_admin_override: Boolean(state.is_admin_override),
     },
     null,
     2
@@ -167,9 +173,16 @@ function verifyAndRevertMemory(targetDir, sessionId) {
         // Hash changed!
         if (state.window_open && state.edits_remaining > 0) {
           // Authorized edit consumed during window
+          const wasAdmin = Boolean(state.is_admin_override);
           state.edits_remaining = 0;
           state.window_open = false;
+          state.is_admin_override = false;
           stateModified = true;
+          if (wasAdmin) {
+            appendLog(targetDir, `MEMORY_ADMIN_OVERRIDE_USED session=${sessionId} path=${src}`);
+          } else {
+            appendLog(targetDir, `MEMORY_EDIT_USED session=${sessionId} path=${src}`);
+          }
           // Update snapshot to reflect authorized change
           fs.copyFileSync(src, snapFile);
           fs.writeFileSync(hashFile, currHash + "\n");
@@ -220,34 +233,66 @@ function isBashMemoryMutation(command, targetDir) {
   if (command.includes("--dry-run")) return false;
 
   const trimmed = command.trim();
-  // Destructive redirects or mutators
-  const hasRedirectOrWrite = /[>|]|sed\s+-i|tee\b|truncate\b|cp\b|mv\b|rm\b|touch\b|python\b|node\b|bun\b|perl\b|nano\b|vim\b|vi\b/i.test(command);
-  if (hasRedirectOrWrite) return true;
-
   const readOnlyPrefixes = /^(?:cat|grep|egrep|fgrep|head|tail|wc|diff|stat|file|less|more)\b/i;
   if (readOnlyPrefixes.test(trimmed)) {
     return false; // read-only safe
   }
 
-  // Any other command referencing memory files is treated as mutation
-  return true;
+  // Destructive redirects or mutators
+  const hasRedirectOrWrite = /[>|]|sed\s+-i|tee\b|truncate\b|cp\b|mv\b|rm\b|touch\b|python\b|node\b|bun\b|perl\b|nano\b|vim\b|vi\b/i.test(command);
+  if (hasRedirectOrWrite) return true;
+
+  // Commands referencing memory without mutating operators (e.g. git checkout, git log, git status)
+  // are not flagged by the preventive regex gate and fall through to the detective hash backstop.
+  return false;
 }
 
 /**
  * Open window on compaction event. Resets edits_remaining to 1 (never stacks).
+ * A second compaction inside an open window refreshes edits_remaining=1 but does not reset
+ * opened_at_turn. The window expires at opened_at_turn + WINDOW_TURNS from the first compaction.
  */
 function onCompaction(targetDir, sessionId, compactionId) {
   // Snapshot memory files at start of compaction window
   snapshotMemory(targetDir);
 
   const state = readState(targetDir);
+  const wasOpen = state.window_open && state.opened_at_turn !== null;
+
   state.window_open = true;
   state.edits_remaining = 1;
-  state.opened_at_turn = state.current_turn;
-  state.opened_at = new Date().toISOString();
+  state.is_admin_override = false;
+  if (!wasOpen) {
+    state.opened_at_turn = state.current_turn;
+    state.opened_at = new Date().toISOString();
+  }
   state.last_compaction_id = compactionId || `comp_${Date.now()}`;
   writeState(targetDir, state);
   appendLog(targetDir, `MEMORY_WINDOW_OPEN session=${sessionId}`);
+  return state;
+}
+
+/**
+ * Admin override to open a single-edit memory window outside compaction.
+ * Logs MEMORY_ADMIN_OVERRIDE admin=<user> reason=<text> session=<sid>.
+ * Fails if reason is empty.
+ */
+function onAdminOverride(targetDir, sessionId, adminUser, reason) {
+  if (!reason || typeof reason !== "string" || !reason.trim()) {
+    throw new Error("Admin override failed: reason must be non-empty");
+  }
+  const user = adminUser && typeof adminUser === "string" && adminUser.trim() ? adminUser.trim() : "admin";
+  const sid = sessionId || "unknown";
+
+  snapshotMemory(targetDir);
+
+  const state = readState(targetDir);
+  state.window_open = true;
+  state.edits_remaining = 1;
+  state.is_admin_override = true;
+  state.admin_override_count = (state.admin_override_count || 0) + 1;
+  writeState(targetDir, state);
+  appendLog(targetDir, `MEMORY_ADMIN_OVERRIDE admin=${user} reason=${reason.trim()} session=${sid}`);
   return state;
 }
 
@@ -273,10 +318,18 @@ function checkAndUseEdit(targetDir, sessionId, filePath) {
   }
 
   // Consume the single allowed edit
+  const wasAdmin = Boolean(state.is_admin_override);
   state.edits_remaining = 0;
   state.window_open = false;
+  state.is_admin_override = false;
   writeState(targetDir, state);
-  appendLog(targetDir, `MEMORY_EDIT_USED session=${sessionId} file=${filePath}`);
+
+  if (wasAdmin) {
+    appendLog(targetDir, `MEMORY_ADMIN_OVERRIDE_USED session=${sessionId} file=${filePath}`);
+  } else {
+    appendLog(targetDir, `MEMORY_EDIT_USED session=${sessionId} file=${filePath}`);
+  }
+
   return {
     allowed: true,
     message: "allowed",
@@ -321,6 +374,11 @@ function getBypassCount(targetDir) {
   return Number(state.bypass_count || 0);
 }
 
+function getAdminOverrideCount(targetDir) {
+  const state = readState(targetDir);
+  return Number(state.admin_override_count || 0);
+}
+
 module.exports = {
   DEFAULT_WINDOW_TURNS,
   LOCKED_MESSAGE,
@@ -330,10 +388,12 @@ module.exports = {
   readState,
   writeState,
   onCompaction,
+  onAdminOverride,
   checkAndUseEdit,
   onTurnComplete,
   getWindowStatus,
   getBypassCount,
+  getAdminOverrideCount,
   isBashTool,
   extractBashCommand,
   isBashMemoryMutation,

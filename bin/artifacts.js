@@ -41,12 +41,24 @@ function updateIndex(dir, topic, relativePath) {
   } catch (_) {}
 }
 
-function rotateArtifacts(storeFile) {
+function recordLastRead(file, storeFile, timestampMs) {
+  try {
+    const dir = artifactDir(storeFile);
+    const lastReadDir = path.join(dir, ".lastread");
+    fs.mkdirSync(lastReadDir, { recursive: true });
+    const marker = path.join(lastReadDir, path.basename(file));
+    const now = typeof timestampMs === "number" ? timestampMs : Date.now();
+    fs.writeFileSync(marker, String(now) + "\n");
+  } catch (_) {}
+}
+
+function rotateArtifacts(storeFile, nowMs) {
   try {
     const dir = artifactDir(storeFile);
     if (!fs.existsSync(dir)) return 0;
     const archiveDir = path.join(dir, "archive");
-    const now = Date.now();
+    const lastReadDir = path.join(dir, ".lastread");
+    const now = typeof nowMs === "number" ? nowMs : Date.now();
     const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
     const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
 
@@ -56,11 +68,33 @@ function rotateArtifacts(storeFile) {
       const full = path.join(dir, f);
       const st = fs.statSync(full);
       const age = now - st.mtimeMs;
-      const unreadAge = now - st.atimeMs;
+
+      // Recency tracking via explicit .lastread marker; if unread, fallback to mtime
+      let lastReadMs = st.mtimeMs;
+      const markerPath = path.join(lastReadDir, f);
+      if (fs.existsSync(markerPath)) {
+        try {
+          const val = Number(fs.readFileSync(markerPath, "utf8").trim());
+          if (!isNaN(val) && val > 0) {
+            lastReadMs = val;
+          } else {
+            lastReadMs = fs.statSync(markerPath).mtimeMs;
+          }
+        } catch (_) {
+          lastReadMs = fs.statSync(markerPath).mtimeMs;
+        }
+      }
+
+      const unreadAge = now - lastReadMs;
 
       if (age > thirtyDaysMs && unreadAge > sevenDaysMs) {
         fs.mkdirSync(archiveDir, { recursive: true });
         fs.renameSync(full, path.join(archiveDir, f));
+        if (fs.existsSync(markerPath)) {
+          try {
+            fs.unlinkSync(markerPath);
+          } catch (_) {}
+        }
         moved++;
       }
     }
@@ -122,8 +156,9 @@ function resolveArtifact(name, storeFile) {
   throw new Error(`no artifact matching ${name}`);
 }
 
-function readArtifact(name, storeFile, offset = 0, limit = 200) {
+function readArtifact(name, storeFile, offset = 0, limit = 200, readTimeMs) {
   const file = resolveArtifact(name, storeFile);
+  recordLastRead(file, storeFile, readTimeMs);
   const lines = fs.readFileSync(file, "utf8").split("\n");
   const start = Math.max(0, Number(offset) || 0);
   const end = start + Math.max(1, Math.min(Number(limit) || 200, 2000));
