@@ -17,6 +17,10 @@ const path = require("path");
 function artifactDir(storeFile) {
   if (process.env.MEMCONDOM_ARTIFACTS) return process.env.MEMCONDOM_ARTIFACTS;
   const base = storeFile ? path.dirname(path.resolve(storeFile)) : process.cwd();
+  const stateArtifacts = path.join(base, "state", "artifacts");
+  if (fs.existsSync(path.join(base, "state")) || fs.existsSync(stateArtifacts)) {
+    return stateArtifacts;
+  }
   return path.join(base, "artifacts");
 }
 
