@@ -32,6 +32,44 @@ function slugify(s) {
     .slice(0, 60) || "note";
 }
 
+function updateIndex(dir, topic, relativePath) {
+  try {
+    const indexPath = path.join(dir, "index.md");
+    const now = new Date();
+    const stamp = now.toISOString().replace("T", " ").slice(0, 16);
+    fs.appendFileSync(indexPath, `${stamp} ${topic} ${relativePath}\n`);
+  } catch (_) {}
+}
+
+function rotateArtifacts(storeFile) {
+  try {
+    const dir = artifactDir(storeFile);
+    if (!fs.existsSync(dir)) return 0;
+    const archiveDir = path.join(dir, "archive");
+    const now = Date.now();
+    const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+
+    let moved = 0;
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith(".md") || f === "index.md") continue;
+      const full = path.join(dir, f);
+      const st = fs.statSync(full);
+      const age = now - st.mtimeMs;
+      const unreadAge = now - st.atimeMs;
+
+      if (age > thirtyDaysMs && unreadAge > sevenDaysMs) {
+        fs.mkdirSync(archiveDir, { recursive: true });
+        fs.renameSync(full, path.join(archiveDir, f));
+        moved++;
+      }
+    }
+    return moved;
+  } catch (_) {
+    return 0;
+  }
+}
+
 function writeArtifact(name, content, storeFile) {
   const dir = artifactDir(storeFile);
   fs.mkdirSync(dir, { recursive: true });
@@ -42,8 +80,11 @@ function writeArtifact(name, content, storeFile) {
   while (fs.existsSync(file)) file = path.join(dir, `${base}-${n++}.md`);
   const body = String(content || "");
   fs.writeFileSync(file, body.endsWith("\n") ? body : body + "\n");
+  const relPath = path.basename(file);
+  updateIndex(dir, slugify(name), relPath);
+  rotateArtifacts(storeFile);
   const lines = body.split("\n").length;
-  return `${path.basename(file)}\t${body.length} bytes\t${lines} lines\t(content NOT injected — read it on demand)`;
+  return `${relPath}\t${body.length} bytes\t${lines} lines\t(content NOT injected — read it on demand)`;
 }
 
 function listArtifacts(storeFile, limit = 40) {
@@ -51,7 +92,7 @@ function listArtifacts(storeFile, limit = 40) {
   if (!fs.existsSync(dir)) return "(no artifacts yet)";
   const files = fs
     .readdirSync(dir)
-    .filter((f) => f.endsWith(".md"))
+    .filter((f) => f.endsWith(".md") && f !== "index.md")
     .map((f) => {
       const st = fs.statSync(path.join(dir, f));
       return { f, size: st.size, mtime: st.mtimeMs };
@@ -75,7 +116,7 @@ function resolveArtifact(name, storeFile) {
   if (fs.existsSync(withMd)) return withMd;
   const needle = slugify(name);
   if (fs.existsSync(dir)) {
-    const hit = fs.readdirSync(dir).filter((f) => f.includes(needle)).sort().pop();
+    const hit = fs.readdirSync(dir).filter((f) => f.includes(needle) && f !== "index.md").sort().pop();
     if (hit) return path.join(dir, hit);
   }
   throw new Error(`no artifact matching ${name}`);
@@ -97,7 +138,7 @@ function grepArtifacts(query, storeFile, limit = 40) {
   const needle = String(query || "").toLowerCase();
   if (!needle) throw new Error("query required");
   const hits = [];
-  for (const f of fs.readdirSync(dir).filter((x) => x.endsWith(".md")).sort()) {
+  for (const f of fs.readdirSync(dir).filter((x) => x.endsWith(".md") && x !== "index.md").sort()) {
     const lines = fs.readFileSync(path.join(dir, f), "utf8").split("\n");
     for (let i = 0; i < lines.length; i++) {
       if (lines[i].toLowerCase().includes(needle)) {
@@ -110,4 +151,13 @@ function grepArtifacts(query, storeFile, limit = 40) {
   return hits.length ? hits.join("\n") : "no matches";
 }
 
-module.exports = { artifactDir, writeArtifact, listArtifacts, readArtifact, grepArtifacts, resolveArtifact };
+module.exports = {
+  artifactDir,
+  writeArtifact,
+  listArtifacts,
+  readArtifact,
+  grepArtifacts,
+  resolveArtifact,
+  updateIndex,
+  rotateArtifacts,
+};

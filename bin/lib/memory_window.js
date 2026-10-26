@@ -10,6 +10,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
 
 const DEFAULT_WINDOW_TURNS = 3;
 const LOCKED_MESSAGE =
@@ -23,6 +24,7 @@ function defaultState() {
     opened_at: null,
     last_compaction_id: null,
     current_turn: 0,
+    bypass_count: 0,
   };
 }
 
@@ -74,6 +76,7 @@ function readState(targetDir) {
       opened_at: parsed.opened_at ?? null,
       last_compaction_id: parsed.last_compaction_id ?? null,
       current_turn: Number(parsed.current_turn || 0),
+      bypass_count: Number(parsed.bypass_count || 0),
     };
   } catch (_) {
     // Missing or corrupt state defaults to locked
@@ -93,6 +96,7 @@ function writeState(targetDir, state) {
       opened_at: state.opened_at,
       last_compaction_id: state.last_compaction_id,
       current_turn: state.current_turn,
+      bypass_count: state.bypass_count || 0,
     },
     null,
     2
@@ -102,10 +106,140 @@ function writeState(targetDir, state) {
   fs.renameSync(tmp, file);
 }
 
+function getSnapshotDir(targetDir) {
+  const base = targetDir ? (path.basename(targetDir) === "state" ? path.dirname(targetDir) : targetDir) : process.cwd();
+  return path.join(base, "state", ".memory_snapshot");
+}
+
+function computeFileHash(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const content = fs.readFileSync(filePath);
+    return crypto.createHash("sha256").update(content).digest("hex");
+  } catch (_) {
+    return null;
+  }
+}
+
+function snapshotMemory(targetDir) {
+  try {
+    const snapDir = getSnapshotDir(targetDir);
+    fs.mkdirSync(snapDir, { recursive: true });
+    const base = targetDir ? (path.basename(targetDir) === "state" ? path.dirname(targetDir) : targetDir) : process.cwd();
+    const targets = ["AGENTS.md", "AGENTS.jsonl"];
+    for (const name of targets) {
+      const src = path.join(base, name);
+      if (fs.existsSync(src)) {
+        const dest = path.join(snapDir, name);
+        fs.copyFileSync(src, dest);
+        const hash = computeFileHash(src);
+        if (hash) {
+          fs.writeFileSync(path.join(snapDir, `${name}.sha256`), hash + "\n");
+        }
+      }
+    }
+  } catch (_) {}
+}
+
+function verifyAndRevertMemory(targetDir, sessionId) {
+  try {
+    const snapDir = getSnapshotDir(targetDir);
+    const base = targetDir ? (path.basename(targetDir) === "state" ? path.dirname(targetDir) : targetDir) : process.cwd();
+    const state = readState(targetDir);
+    const targets = ["AGENTS.md", "AGENTS.jsonl"];
+
+    let stateModified = false;
+
+    for (const name of targets) {
+      const src = path.join(base, name);
+      const snapFile = path.join(snapDir, name);
+      const hashFile = path.join(snapDir, `${name}.sha256`);
+
+      if (!fs.existsSync(snapFile) || !fs.existsSync(hashFile)) {
+        snapshotMemory(targetDir);
+        continue;
+      }
+
+      const snapHash = fs.readFileSync(hashFile, "utf8").trim();
+      const currHash = computeFileHash(src);
+
+      if (currHash && snapHash && currHash !== snapHash) {
+        // Hash changed!
+        if (state.window_open && state.edits_remaining > 0) {
+          // Authorized edit consumed during window
+          state.edits_remaining = 0;
+          state.window_open = false;
+          stateModified = true;
+          // Update snapshot to reflect authorized change
+          fs.copyFileSync(src, snapFile);
+          fs.writeFileSync(hashFile, currHash + "\n");
+        } else {
+          // UNLAWFUL BYPASS DETECTED!
+          const prev8 = snapHash.slice(0, 8);
+          const curr8 = currHash.slice(0, 8);
+          appendLog(targetDir, `MEMORY_EDIT_BYPASS session=${sessionId} path=${src} prev=${prev8} curr=${curr8}`);
+
+          // Revert file immediately from snapshot
+          fs.copyFileSync(snapFile, src);
+
+          state.bypass_count = (state.bypass_count || 0) + 1;
+          stateModified = true;
+        }
+      }
+    }
+
+    if (stateModified) {
+      writeState(targetDir, state);
+    }
+  } catch (_) {}
+}
+
+function isBashTool(tool) {
+  if (!tool || typeof tool !== "string") return false;
+  const t = tool.toLowerCase();
+  return ["bash", "shell", "sh", "exec", "terminal", "run_command"].includes(t);
+}
+
+function extractBashCommand(input) {
+  if (!input) return "";
+  if (typeof input === "string") return input;
+  if (input.command) return String(input.command);
+  if (input.cmd) return String(input.cmd);
+  if (input.script) return String(input.script);
+  if (input.CommandLine) return String(input.CommandLine);
+  return "";
+}
+
+function isBashMemoryMutation(command, targetDir) {
+  if (!command || typeof command !== "string") return false;
+  // Match AGENTS.md or AGENTS.jsonl (case-insensitive, optional path prefix)
+  const memPattern = /(?:^|[\s"'`\\/=])(?:[a-zA-Z0-9_.\-\/]*\/)?AGENTS\.(?:md|jsonl)(?:$|[\s"'`\\/=;&|])/i;
+  if (!memPattern.test(command)) return false;
+
+  // Allow --dry-run
+  if (command.includes("--dry-run")) return false;
+
+  const trimmed = command.trim();
+  // Destructive redirects or mutators
+  const hasRedirectOrWrite = /[>|]|sed\s+-i|tee\b|truncate\b|cp\b|mv\b|rm\b|touch\b|python\b|node\b|bun\b|perl\b|nano\b|vim\b|vi\b/i.test(command);
+  if (hasRedirectOrWrite) return true;
+
+  const readOnlyPrefixes = /^(?:cat|grep|egrep|fgrep|head|tail|wc|diff|stat|file|less|more)\b/i;
+  if (readOnlyPrefixes.test(trimmed)) {
+    return false; // read-only safe
+  }
+
+  // Any other command referencing memory files is treated as mutation
+  return true;
+}
+
 /**
  * Open window on compaction event. Resets edits_remaining to 1 (never stacks).
  */
 function onCompaction(targetDir, sessionId, compactionId) {
+  // Snapshot memory files at start of compaction window
+  snapshotMemory(targetDir);
+
   const state = readState(targetDir);
   state.window_open = true;
   state.edits_remaining = 1;
@@ -129,6 +263,15 @@ function checkAndUseEdit(targetDir, sessionId, filePath) {
     };
   }
 
+  // Check direct AGENTS.md edit
+  const norm = String(filePath || "").replace(/\\/g, "/");
+  if (norm.endsWith("/AGENTS.md") || norm === "AGENTS.md") {
+    appendLog(
+      targetDir,
+      `MEMORY_EDIT_DIRECT session=${sessionId} warning=direct AGENTS.md edits diverge from source JSONL and will be overwritten on next render`
+    );
+  }
+
   // Consume the single allowed edit
   state.edits_remaining = 0;
   state.window_open = false;
@@ -144,6 +287,9 @@ function checkAndUseEdit(targetDir, sessionId, filePath) {
  * Advance turn counter and check expiration.
  */
 function onTurnComplete(targetDir, sessionId, windowTurns = DEFAULT_WINDOW_TURNS) {
+  // Backstop: verify hashes and revert bypasses
+  verifyAndRevertMemory(targetDir, sessionId);
+
   const state = readState(targetDir);
   state.current_turn += 1;
 
@@ -170,6 +316,11 @@ function getWindowStatus(targetDir) {
   return "closed";
 }
 
+function getBypassCount(targetDir) {
+  const state = readState(targetDir);
+  return Number(state.bypass_count || 0);
+}
+
 module.exports = {
   DEFAULT_WINDOW_TURNS,
   LOCKED_MESSAGE,
@@ -182,4 +333,11 @@ module.exports = {
   checkAndUseEdit,
   onTurnComplete,
   getWindowStatus,
+  getBypassCount,
+  isBashTool,
+  extractBashCommand,
+  isBashMemoryMutation,
+  snapshotMemory,
+  verifyAndRevertMemory,
+  computeFileHash,
 };
