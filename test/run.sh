@@ -2,6 +2,7 @@
 # End-to-end check: append, validate, render determinism, rejection, prune, MCP round trip.
 set -uo pipefail
 BIN="$(cd "$(dirname "$0")/.." && pwd)/bin"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 T="$(mktemp -d)"
 fails=0
 ok()   { printf '  ok   %s\n' "$1"; }
@@ -41,12 +42,29 @@ echo "$out" | grep -q "body text" && ok "artifact write + read" || bad "artifact
 echo "$out" | grep -q "2026-" && ok "artifact is timestamp-named" || bad "artifact is timestamp-named"
 
 M="$T/mcp.jsonl"
+# Without a post-compaction window the store is locked: a write must be refused, not silently
+# accepted. This is the gate the agents actually hit, so it is tested first.
+locked=$(printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_memory","arguments":{"text":"locked fact","topic":"mcp"}}}' \
+  | MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js")
+echo "$locked" | grep -q "MEMORY_LOCKED" && ok "memory write refused without a compaction window" || bad "memory write refused without a compaction window"
+
+# Open the 80-turn window the way a compaction event does, then the same write must land.
+node -e "require('$ROOT/bin/lib/memory_window.js').onCompaction('$T','ses_test','c_test')" >/dev/null 2>&1
 out=$(printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_memory","arguments":{"text":"mcp fact","topic":"mcp"}}}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_memories","arguments":{"limit":5}}}' \
   | MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js")
-echo "$out" | grep -q "mcp fact" && ok "MCP add + read" || bad "MCP add + read"
+echo "$out" | grep -q "mcp fact" && ok "MCP add + read inside the window" || bad "MCP add + read inside the window"
+
+# The window is a turn budget, not a single edit: a second write in the same window must work.
+second=$(printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_memory","arguments":{"text":"second fact","topic":"mcp"}}}' \
+  | MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js")
+echo "$second" | grep -q "second fact\|ok" && ok "second write allowed inside the same window" || bad "second write allowed inside the same window"
 
 rm -rf "$T"
 [ "$fails" -eq 0 ] && { echo "all checks passed"; exit 0; } || { echo "$fails check(s) failed"; exit 1; }

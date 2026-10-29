@@ -12,14 +12,28 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 
-const DEFAULT_WINDOW_TURNS = 3;
+// Owner (2026-10-28): a compaction opens an 80-TURN budget, not a single edit. One edit was
+// too tight for a stack that learns several things an hour; 80 turns covers the work that
+// follows a compaction while keeping memory edits off the hot path. Artifacts are never
+// gated — state/artifacts/<name>.md is writable at any time, window or not.
+const DEFAULT_WINDOW_TURNS = Number(process.env.MEMORY_WINDOW_TURNS || 80);
 const LOCKED_MESSAGE =
-  "MEMORY_LOCKED: you may not edit AGENTS.md/AGENTS.jsonl outside the post-compaction window. Write to state/artifacts/<name>.md instead; you will get one memory edit immediately after the next compaction.";
+  `MEMORY_LOCKED: memory edits are only allowed inside the ${DEFAULT_WINDOW_TURNS}-turn window that opens after a compaction. Write the note to state/artifacts/<name>.md instead — artifacts are always writable — and it will be promoted next time the window opens.`;
+
+function memoryUnlockMessage(turns = DEFAULT_WINDOW_TURNS) {
+  return (
+    `COMPACTION DONE — MEMORY UNLOCKED for the next ${turns} turns. ` +
+    "Write the durable facts you learned now (write_memory / edit_memory); memory locks again when the window closes. " +
+    "Anything that does not belong in injected memory still goes to state/artifacts/<name>.md, which is never locked."
+  );
+}
 
 function defaultState() {
   return {
     window_open: false,
     edits_remaining: 0,
+    turns_remaining: 0,
+    edits_used: 0,
     opened_at_turn: null,
     opened_at: null,
     last_compaction_id: null,
@@ -172,16 +186,18 @@ function verifyAndRevertMemory(targetDir, sessionId) {
       if (currHash && snapHash && currHash !== snapHash) {
         // Hash changed!
         if (state.window_open && state.edits_remaining > 0) {
-          // Authorized edit consumed during window
+          // Authorized edit inside the 80-turn budget. It does NOT consume the window:
+          // the budget is turns, so the hash is refreshed and the window stays open.
           const wasAdmin = Boolean(state.is_admin_override);
-          state.edits_remaining = 0;
-          state.window_open = false;
-          state.is_admin_override = false;
+          state.edits_used = (state.edits_used || 0) + 1;
           stateModified = true;
           if (wasAdmin) {
             appendLog(targetDir, `MEMORY_ADMIN_OVERRIDE_USED session=${sessionId} path=${src}`);
           } else {
-            appendLog(targetDir, `MEMORY_EDIT_USED session=${sessionId} path=${src}`);
+            appendLog(
+              targetDir,
+              `MEMORY_EDIT_USED session=${sessionId} path=${src} turns_left=${state.turns_remaining}`
+            );
           }
           // Update snapshot to reflect authorized change
           fs.copyFileSync(src, snapFile);
@@ -260,7 +276,8 @@ function onCompaction(targetDir, sessionId, compactionId) {
   const wasOpen = state.window_open && state.opened_at_turn !== null;
 
   state.window_open = true;
-  state.edits_remaining = 1;
+  state.turns_remaining = DEFAULT_WINDOW_TURNS;
+  state.edits_remaining = DEFAULT_WINDOW_TURNS;
   state.is_admin_override = false;
   if (!wasOpen) {
     state.opened_at_turn = state.current_turn;
@@ -268,7 +285,10 @@ function onCompaction(targetDir, sessionId, compactionId) {
   }
   state.last_compaction_id = compactionId || `comp_${Date.now()}`;
   writeState(targetDir, state);
-  appendLog(targetDir, `MEMORY_WINDOW_OPEN session=${sessionId}`);
+  appendLog(
+    targetDir,
+    `MEMORY_WINDOW_OPEN session=${sessionId} turns=${state.turns_remaining} (${DEFAULT_WINDOW_TURNS})`
+  );
   return state;
 }
 
@@ -317,11 +337,9 @@ function checkAndUseEdit(targetDir, sessionId, filePath) {
     );
   }
 
-  // Consume the single allowed edit
+  // An edit inside the window costs a log line, not the window: the budget is turns.
   const wasAdmin = Boolean(state.is_admin_override);
-  state.edits_remaining = 0;
-  state.window_open = false;
-  state.is_admin_override = false;
+  state.edits_used = (state.edits_used || 0) + 1;
   writeState(targetDir, state);
 
   if (wasAdmin) {
@@ -346,12 +364,13 @@ function onTurnComplete(targetDir, sessionId, windowTurns = DEFAULT_WINDOW_TURNS
   const state = readState(targetDir);
   state.current_turn += 1;
 
-  if (state.window_open && state.edits_remaining === 1) {
+  if (state.window_open) {
     const elapsed = state.current_turn - (state.opened_at_turn ?? state.current_turn);
-    if (elapsed >= windowTurns) {
+    state.turns_remaining = Math.max(0, windowTurns - elapsed);
+    state.edits_remaining = state.turns_remaining;
+    if (state.turns_remaining <= 0) {
       state.window_open = false;
-      state.edits_remaining = 0;
-      appendLog(targetDir, `MEMORY_WINDOW_EXPIRED session=${sessionId}`);
+      appendLog(targetDir, `MEMORY_WINDOW_EXPIRED session=${sessionId} after ${windowTurns} turns`);
     }
   }
 
@@ -381,6 +400,7 @@ function getAdminOverrideCount(targetDir) {
 
 module.exports = {
   DEFAULT_WINDOW_TURNS,
+  memoryUnlockMessage,
   LOCKED_MESSAGE,
   defaultState,
   resolveStateFile,
