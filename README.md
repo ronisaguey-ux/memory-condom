@@ -84,6 +84,18 @@ That is the progressive-disclosure trade: memory store for what the model must a
 
 `AGENTS.md` is an open standard read automatically by OpenCode, Codex, Cursor, Jules and others. Injecting a `.json` instead would break that loader and every tool that looks for the standard filename. So the JSONL is canonical and `AGENTS.md` is **generated from it** — deterministic output in insertion order, which is the property the cache needs. Edit the store, run `render`, never hand-edit the markdown.
 
+## The post-compaction memory window
+
+Memory writes are gated: an agent may edit injected memory **only inside the 80-turn budget that opens when a compaction finishes** (owner, 2026-10-28). Before that it was a single edit per compaction, which was too tight for a stack that learns several things an hour.
+
+- The window is a **turn budget, not an edit budget**. `write_memory` / `edit_memory` / `delete_memory` work any number of times while turns remain; each assistant turn spends one.
+- `MEMORY_WINDOW_TURNS` overrides the default of 80.
+- When the window opens the plugin injects `COMPACTION DONE — MEMORY UNLOCKED for the next 80 turns…` into the session, so the agent knows to write now.
+- Outside the window the store answers `MEMORY_LOCKED`, and the note belongs in `state/artifacts/<name>.md`.
+- **Artifacts are never gated.** `write_artifact` works at any time, window or not — that is what makes the lock survivable.
+
+State lives in `state/memory_window.json` beside the store; `state/memory-window.log` records every open, edit, expiry and bypass revert.
+
 ## Invariants
 
 1. Append only. New facts go at the bottom.
