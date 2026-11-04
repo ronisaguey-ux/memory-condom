@@ -318,3 +318,111 @@ function isBashMemoryMutation(command, targetDir) {
  */
 function onCompaction(targetDir, sessionId, compactionId) {
     // Snapshot memory files at start of compaction window
+    snapshotMemory(targetDir);
+    const state = readState(targetDir);
+    const wasOpen = state.window_open && state.opened_at_turn !== null;
+    state.window_open = true;
+    state.turns_remaining = exports.DEFAULT_WINDOW_TURNS;
+    state.edits_remaining = exports.DEFAULT_WINDOW_TURNS;
+    state.is_admin_override = false;
+    if (!wasOpen) {
+        state.opened_at_turn = state.current_turn;
+        state.opened_at = new Date().toISOString();
+    }
+    state.last_compaction_id = compactionId || `comp_${Date.now()}`;
+    writeState(targetDir, state);
+    appendLog(targetDir, `MEMORY_WINDOW_OPEN session=${sessionId} turns=${state.turns_remaining} (${exports.DEFAULT_WINDOW_TURNS})`);
+    return state;
+}
+/**
+ * Admin override to open a single-edit memory window outside compaction.
+ * Logs MEMORY_ADMIN_OVERRIDE admin=<user> reason=<text> session=<sid>.
+ * Fails if reason is empty.
+ */
+function onAdminOverride(targetDir, sessionId, adminUser, reason) {
+    if (!reason || typeof reason !== "string" || !reason.trim()) {
+        throw new Error("Admin override failed: reason must be non-empty");
+    }
+    const user = adminUser && typeof adminUser === "string" && adminUser.trim() ? adminUser.trim() : "admin";
+    const sid = sessionId || "unknown";
+    snapshotMemory(targetDir);
+    const state = readState(targetDir);
+    state.window_open = true;
+    state.edits_remaining = 1;
+    state.is_admin_override = true;
+    state.admin_override_count = (state.admin_override_count || 0) + 1;
+    writeState(targetDir, state);
+    appendLog(targetDir, `MEMORY_ADMIN_OVERRIDE admin=${user} reason=${reason.trim()} session=${sid}`);
+    return state;
+}
+/**
+ * Gate memory edit attempt. Returns allowed boolean or throws/rejects.
+ */
+function checkAndUseEdit(targetDir, sessionId, filePath) {
+    const state = readState(targetDir);
+    if (!state.window_open || state.edits_remaining <= 0) {
+        return {
+            allowed: false,
+            message: exports.LOCKED_MESSAGE,
+        };
+    }
+    // Check direct AGENTS.md edit
+    const norm = String(filePath || "").replace(/\\/g, "/");
+    if (norm.endsWith("/AGENTS.md") || norm === "AGENTS.md") {
+        appendLog(targetDir, `MEMORY_EDIT_DIRECT session=${sessionId} warning=direct AGENTS.md edits diverge from source JSONL and will be overwritten on next render`);
+    }
+    // An edit inside the window costs a log line, not the window: the budget is turns.
+    const wasAdmin = Boolean(state.is_admin_override);
+    state.edits_used = (state.edits_used || 0) + 1;
+    writeState(targetDir, state);
+    if (wasAdmin) {
+        appendLog(targetDir, `MEMORY_ADMIN_OVERRIDE_USED session=${sessionId} file=${filePath}`);
+    }
+    else {
+        appendLog(targetDir, `MEMORY_EDIT_USED session=${sessionId} file=${filePath}`);
+    }
+    return {
+        allowed: true,
+        message: "allowed",
+    };
+}
+/**
+ * Advance turn counter and check expiration.
+ */
+function onTurnComplete(targetDir, sessionId, windowTurns = exports.DEFAULT_WINDOW_TURNS) {
+    // Backstop: verify hashes and revert bypasses
+    verifyAndRevertMemory(targetDir, sessionId);
+    const state = readState(targetDir);
+    state.current_turn += 1;
+    if (state.window_open) {
+        const elapsed = state.current_turn - (state.opened_at_turn ?? state.current_turn);
+        const remaining = Math.max(0, windowTurns - elapsed);
+        state.turns_remaining = remaining;
+        state.edits_remaining = remaining;
+        if (state.turns_remaining <= 0) {
+            state.window_open = false;
+            appendLog(targetDir, `MEMORY_WINDOW_EXPIRED session=${sessionId} after ${windowTurns} turns`);
+        }
+    }
+    writeState(targetDir, state);
+    return state;
+}
+/**
+ * Query window status for stack_ctl.py (open | closed | used).
+ */
+function getWindowStatus(targetDir) {
+    const state = readState(targetDir);
+    if (state.window_open && state.edits_remaining > 0)
+        return "open";
+    if (!state.window_open && state.edits_remaining === 0 && state.opened_at)
+        return "used";
+    return "closed";
+}
+function getBypassCount(targetDir) {
+    const state = readState(targetDir);
+    return Number(state.bypass_count || 0);
+}
+function getAdminOverrideCount(targetDir) {
+    const state = readState(targetDir);
+    return Number(state.admin_override_count || 0);
+}
