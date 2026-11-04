@@ -1,0 +1,320 @@
+"use strict";
+/**
+ * memory_window — Post-Compaction-Only Memory Edit Window State Machine
+ *
+ * Implements the invariant: an agent may edit injected memory (AGENTS.md / AGENTS.jsonl)
+ * only once, and only inside the window immediately following a compaction event.
+ * Outside that window, notes must go to non-injected artifacts (state/artifacts/<topic>.md).
+ */
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.LOCKED_MESSAGE = exports.DEFAULT_WINDOW_TURNS = void 0;
+exports.memoryUnlockMessage = memoryUnlockMessage;
+exports.defaultState = defaultState;
+exports.resolveStateFile = resolveStateFile;
+exports.resolveLogFile = resolveLogFile;
+exports.readState = readState;
+exports.writeState = writeState;
+exports.computeFileHash = computeFileHash;
+exports.snapshotMemory = snapshotMemory;
+exports.verifyAndRevertMemory = verifyAndRevertMemory;
+exports.isBashTool = isBashTool;
+exports.extractBashCommand = extractBashCommand;
+exports.isBashMemoryMutation = isBashMemoryMutation;
+exports.onCompaction = onCompaction;
+exports.onAdminOverride = onAdminOverride;
+exports.checkAndUseEdit = checkAndUseEdit;
+exports.onTurnComplete = onTurnComplete;
+exports.getWindowStatus = getWindowStatus;
+exports.getBypassCount = getBypassCount;
+exports.getAdminOverrideCount = getAdminOverrideCount;
+const fs = __importStar(require("node:fs"));
+const path = __importStar(require("node:path"));
+const crypto = __importStar(require("node:crypto"));
+// Owner (2026-10-28): a compaction opens an 80-TURN budget, not a single edit. One edit was
+// too tight for a stack that learns several things an hour; 80 turns covers the work that
+// follows a compaction while keeping memory edits off the hot path. Artifacts are never
+// gated — state/artifacts/<name>.md is writable at any time, window or not.
+exports.DEFAULT_WINDOW_TURNS = Number(process.env.MEMORY_WINDOW_TURNS || 80);
+exports.LOCKED_MESSAGE = `MEMORY_LOCKED: memory edits are only allowed inside the ${exports.DEFAULT_WINDOW_TURNS}-turn window that opens after a compaction. Write the note to state/artifacts/<name>.md instead — artifacts are always writable — and it will be promoted next time the window opens.`;
+function memoryUnlockMessage(turns = exports.DEFAULT_WINDOW_TURNS) {
+    return (`COMPACTION DONE — MEMORY UNLOCKED for the next ${turns} turns. ` +
+        "Write the durable facts you learned now (write_memory / edit_memory); memory locks again when the window closes. " +
+        "Anything that does not belong in injected memory still goes to state/artifacts/<name>.md, which is never locked.");
+}
+function defaultState() {
+    return {
+        window_open: false,
+        edits_remaining: 0,
+        turns_remaining: 0,
+        edits_used: 0,
+        opened_at_turn: null,
+        opened_at: null,
+        last_compaction_id: null,
+        current_turn: 0,
+        bypass_count: 0,
+        admin_override_count: 0,
+        is_admin_override: false,
+    };
+}
+function resolveStateFile(targetDir) {
+    if (!targetDir)
+        targetDir = process.cwd();
+    if (path.basename(targetDir) === "state") {
+        return path.join(targetDir, "memory_window.json");
+    }
+    return path.join(targetDir, "state", "memory_window.json");
+}
+function resolveLogFile(targetDir) {
+    if (!targetDir)
+        targetDir = process.cwd();
+    if (path.basename(targetDir) === "state") {
+        return path.join(targetDir, "memory-window.log");
+    }
+    return path.join(targetDir, "state", "memory-window.log");
+}
+function appendLog(targetDir, line) {
+    try {
+        const logFile = resolveLogFile(targetDir);
+        fs.mkdirSync(path.dirname(logFile), { recursive: true });
+        const stamp = new Date().toISOString();
+        fs.appendFileSync(logFile, `${stamp} ${line}\n`);
+    }
+    catch {
+        // Non-fatal logging
+    }
+}
+function readState(targetDir) {
+    const file = resolveStateFile(targetDir);
+    try {
+        if (!fs.existsSync(file))
+            return defaultState();
+        const raw = fs.readFileSync(file, "utf8");
+        const parsed = JSON.parse(raw);
+        if (typeof parsed !== "object" ||
+            parsed === null ||
+            typeof parsed.window_open !== "boolean" ||
+            typeof parsed.edits_remaining !== "number") {
+            return defaultState();
+        }
+        const p = parsed;
+        return {
+            window_open: Boolean(p.window_open),
+            edits_remaining: Number(p.edits_remaining),
+            opened_at_turn: p.opened_at_turn ?? null,
+            opened_at: p.opened_at ?? null,
+            last_compaction_id: p.last_compaction_id ?? null,
+            current_turn: Number(p.current_turn || 0),
+            bypass_count: Number(p.bypass_count || 0),
+            admin_override_count: Number(p.admin_override_count || 0),
+            is_admin_override: Boolean(p.is_admin_override),
+        };
+    }
+    catch {
+        // Missing or corrupt state defaults to locked
+        return defaultState();
+    }
+}
+function writeState(targetDir, state) {
+    const file = resolveStateFile(targetDir);
+    const dir = path.dirname(file);
+    fs.mkdirSync(dir, { recursive: true });
+    const data = JSON.stringify({
+        window_open: state.window_open,
+        edits_remaining: state.edits_remaining,
+        opened_at_turn: state.opened_at_turn,
+        opened_at: state.opened_at,
+        last_compaction_id: state.last_compaction_id,
+        current_turn: state.current_turn,
+        bypass_count: state.bypass_count || 0,
+        admin_override_count: state.admin_override_count || 0,
+        is_admin_override: Boolean(state.is_admin_override),
+    }, null, 2);
+    const tmp = `${file}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
+    fs.writeFileSync(tmp, data + "\n");
+    fs.renameSync(tmp, file);
+}
+function getSnapshotDir(targetDir) {
+    const base = targetDir
+        ? path.basename(targetDir) === "state"
+            ? path.dirname(targetDir)
+            : targetDir
+        : process.cwd();
+    return path.join(base, "state", ".memory_snapshot");
+}
+function computeFileHash(filePath) {
+    try {
+        if (!fs.existsSync(filePath))
+            return null;
+        const content = fs.readFileSync(filePath);
+        return crypto.createHash("sha256").update(content).digest("hex");
+    }
+    catch {
+        return null;
+    }
+}
+function snapshotMemory(targetDir) {
+    try {
+        const snapDir = getSnapshotDir(targetDir);
+        fs.mkdirSync(snapDir, { recursive: true });
+        const base = targetDir
+            ? path.basename(targetDir) === "state"
+                ? path.dirname(targetDir)
+                : targetDir
+            : process.cwd();
+        const targets = ["AGENTS.md", "AGENTS.jsonl"];
+        for (const name of targets) {
+            const src = path.join(base, name);
+            if (fs.existsSync(src)) {
+                const dest = path.join(snapDir, name);
+                fs.copyFileSync(src, dest);
+                const hash = computeFileHash(src);
+                if (hash) {
+                    fs.writeFileSync(path.join(snapDir, `${name}.sha256`), hash + "\n");
+                }
+            }
+        }
+    }
+    catch { }
+}
+function verifyAndRevertMemory(targetDir, sessionId) {
+    try {
+        const snapDir = getSnapshotDir(targetDir);
+        const base = targetDir
+            ? path.basename(targetDir) === "state"
+                ? path.dirname(targetDir)
+                : targetDir
+            : process.cwd();
+        const state = readState(targetDir);
+        const targets = ["AGENTS.md", "AGENTS.jsonl"];
+        let stateModified = false;
+        for (const name of targets) {
+            const src = path.join(base, name);
+            const snapFile = path.join(snapDir, name);
+            const hashFile = path.join(snapDir, `${name}.sha256`);
+            if (!fs.existsSync(snapFile) || !fs.existsSync(hashFile)) {
+                snapshotMemory(targetDir);
+                continue;
+            }
+            const snapHash = fs.readFileSync(hashFile, "utf8").trim();
+            const currHash = computeFileHash(src);
+            if (currHash && snapHash && currHash !== snapHash) {
+                // Hash changed!
+                if (state.window_open && state.edits_remaining > 0) {
+                    // Authorized edit inside the 80-turn budget. It does NOT consume the window:
+                    // the budget is turns, so the hash is refreshed and the window stays open.
+                    const wasAdmin = Boolean(state.is_admin_override);
+                    state.edits_used = (state.edits_used || 0) + 1;
+                    stateModified = true;
+                    if (wasAdmin) {
+                        appendLog(targetDir, `MEMORY_ADMIN_OVERRIDE_USED session=${sessionId} path=${src}`);
+                    }
+                    else {
+                        appendLog(targetDir, `MEMORY_EDIT_USED session=${sessionId} path=${src} turns_left=${state.turns_remaining}`);
+                    }
+                    // Update snapshot to reflect authorized change
+                    fs.copyFileSync(src, snapFile);
+                    fs.writeFileSync(hashFile, currHash + "\n");
+                }
+                else {
+                    // UNLAWFUL BYPASS DETECTED!
+                    const prev8 = snapHash.slice(0, 8);
+                    const curr8 = currHash.slice(0, 8);
+                    appendLog(targetDir, `MEMORY_EDIT_BYPASS session=${sessionId} path=${src} prev=${prev8} curr=${curr8}`);
+                    // Revert file immediately from snapshot
+                    fs.copyFileSync(snapFile, src);
+                    state.bypass_count = (state.bypass_count || 0) + 1;
+                    stateModified = true;
+                }
+            }
+        }
+        if (stateModified) {
+            writeState(targetDir, state);
+        }
+    }
+    catch { }
+}
+function isBashTool(tool) {
+    if (!tool || typeof tool !== "string")
+        return false;
+    const t = tool.toLowerCase();
+    return ["bash", "shell", "sh", "exec", "terminal", "run_command"].includes(t);
+}
+function extractBashCommand(input) {
+    if (!input)
+        return "";
+    if (typeof input === "string")
+        return input;
+    const i = input;
+    if (i.command)
+        return String(i.command);
+    if (i.cmd)
+        return String(i.cmd);
+    if (i.script)
+        return String(i.script);
+    if (i.CommandLine)
+        return String(i.CommandLine);
+    return "";
+}
+function isBashMemoryMutation(command, targetDir) {
+    if (!command || typeof command !== "string")
+        return false;
+    // Match AGENTS.md or AGENTS.jsonl (case-insensitive, optional path prefix)
+    const memPattern = /(?:^|[\s"'`\\/=])(?:[a-zA-Z0-9_.\-\/]*\/)?AGENTS\.(?:md|jsonl)(?:$|[\s"'`\\/=;&|])/i;
+    if (!memPattern.test(command))
+        return false;
+    // Allow --dry-run
+    if (command.includes("--dry-run"))
+        return false;
+    const trimmed = command.trim();
+    const readOnlyPrefixes = /^(?:cat|grep|egrep|fgrep|head|tail|wc|diff|stat|file|less|more)\b/i;
+    if (readOnlyPrefixes.test(trimmed)) {
+        return false; // read-only safe
+    }
+    // Destructive redirects or mutators
+    const hasRedirectOrWrite = /[>|]|sed\s+-i|tee\b|truncate\b|cp\b|mv\b|rm\b|touch\b|python\b|node\b|bun\b|perl\b|nano\b|vim\b|vi\b/i.test(command);
+    if (hasRedirectOrWrite)
+        return true;
+    // Commands referencing memory without mutating operators (e.g. git checkout, git log, git status)
+    // are not flagged by the preventive regex gate and fall through to the detective hash backstop.
+    return false;
+}
+/**
+ * Open window on compaction event. Resets edits_remaining to 1 (never stacks).
+ * A second compaction inside an open window refreshes edits_remaining=1 but does not reset
+ * opened_at_turn. The window expires at opened_at_turn + WINDOW_TURNS from the first compaction.
+ */
+function onCompaction(targetDir, sessionId, compactionId) {
+    // Snapshot memory files at start of compaction window
