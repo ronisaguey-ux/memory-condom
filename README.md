@@ -109,3 +109,18 @@ State lives in `state/memory_window.json` beside the store; `state/memory-window
 ```bash
 test/run.sh
 ```
+
+## Source layout
+
+The implementation is TypeScript in `src/`, compiled to CommonJS in `dist/`, so every existing
+`require()` keeps working unchanged.
+
+```bash
+npm install       # typescript + @types/node, dev only — the runtime still has zero dependencies
+npm run build     # tsc -> dist/
+npm run typecheck # tsc --noEmit
+```
+
+`bin/memcondom.js`, `bin/memcondom-mcp.js`, `bin/artifacts.js` and `bin/lib/*.js` are executable
+shims that load `dist/`; their paths are referenced by MCP configs and systemd units, so they must
+not move. `dist/` is committed because there is no build step at runtime.
