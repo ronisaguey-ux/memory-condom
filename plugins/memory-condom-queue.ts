@@ -14,7 +14,7 @@
  * and the whole queue lands exactly once at the next compaction.
  */
 
-import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
@@ -50,10 +50,34 @@ function storeDir(candidate?: string): string {
 }
 
 /** Run the applier once. It is idempotent: applied entries are frozen. */
-function applyQueue(workspace: string | undefined, reason: string): void {
-  const dir = storeDir(workspace);
+/**
+ * Cheap gate before spawning the applier: the compacted event fires for every session in
+ * every workspace, so spawning a node process per event filled 180k lines of log and burned
+ * CPU for nothing. Read the queue first; only shell out when this session has work.
+ */
+function hasPending(dir: string, session?: string): boolean {
+  const file = join(dir, "state", "future_memories.json");
+  if (!existsSync(file)) return false;
   try {
-    const child = spawn(NODE, [MCP, "--apply-queued", dir], {
+    const entries = JSON.parse(readFileSync(file, "utf8"));
+    if (!Array.isArray(entries)) return false;
+    return entries.some(
+      (entry: any) => entry && entry.applied_at == null && Boolean(session) && entry.session === session,
+    );
+  } catch {
+    return false;
+  }
+}
+
+function applyQueue(workspace: string | undefined, reason: string, session?: string): void {
+  const dir = storeDir(workspace);
+  if (!hasPending(dir, session)) return;
+  try {
+    // The session id scopes the queue: another session compacting in the same store must
+    // not consume changes this one queued.
+    const args = [MCP, "--apply-queued", dir];
+    if (session) args.push("--session", session);
+    const child = spawn(NODE, args, {
       detached: true,
       stdio: ["ignore", "ignore", "pipe"],
     });
@@ -119,7 +143,7 @@ async function registerPlugin(ctx: PluginCtx): Promise<() => void> {
         const sid = event?.sessionID;
         const dir = event?.directory || home;
         log(`compaction hook session=${sid || "?"} workspace=${dir || "?"}`);
-        applyQueue(dir, "compaction-hook");
+        applyQueue(dir, "compaction-hook", sid);
       });
     }
   } catch (error) {
@@ -143,7 +167,7 @@ async function registerPlugin(ctx: PluginCtx): Promise<() => void> {
               } catch {}
             }
             log(`compacted event session=${sid || "?"} workspace=${dir || home || "?"}`);
-            applyQueue(dir || home, "compacted-event");
+            applyQueue(dir || home, "compacted-event", sid);
             installNextPrompt("compacted-event");
           }
         } catch (error) {
