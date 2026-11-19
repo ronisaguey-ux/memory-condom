@@ -79,5 +79,17 @@ grep -q "corrected after review" "$M" && ok "correction reached the store" || ba
 frozen=$(MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" --apply-queued "$T")
 echo "$frozen" | grep -q "no queued memories" && ok "queue is empty and frozen" || bad "queue is empty and frozen"
 
+S="$T/scope"
+: > "$S"
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_memory","arguments":{"text":"scoped fact","topic":"scope"}}}' \
+  | OPENCODE_SESSION_ID=ses_owner MEMCONDOM_FILE="$S" node "$BIN/memcondom-mcp.js" >/dev/null
+other=$(MEMCONDOM_FILE="$S" node "$BIN/memcondom-mcp.js" --apply-queued "$T" --session ses_other)
+echo "$other" | grep -q "no queued memories" && ok "another session cannot consume the queue" || bad "another session cannot consume the queue"
+[ -s "$S" ] && bad "queue must stay unapplied" || ok "queue must stay unapplied"
+owner=$(MEMCONDOM_FILE="$S" node "$BIN/memcondom-mcp.js" --apply-queued "$T" --session ses_owner)
+echo "$owner" | grep -q "appended" && ok "the queuing session applies its own queue" || bad "the queuing session applies its own queue"
+
 rm -rf "$T"
 [ "$fails" -eq 0 ] && { echo "all checks passed"; exit 0; } || { echo "$fails check(s) failed"; exit 1; }
