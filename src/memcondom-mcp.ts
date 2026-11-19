@@ -114,7 +114,7 @@ function applyAdd(file: string, text: string, topic: string): string {
 
 function applyEdit(file: string, ref: string, text: string, topic?: string): string {
   const records = readStore(file);
-  if (!records.some((r) => r.id === ref && !r.op)) throw new Error(`no record ${ref}`);
+  if (!resolve(records).some((r) => r.id === ref)) throw new Error(`no record ${ref}`);
   const rec: StoreRecord = { op: "edit", ref, ts: today(), text };
   if (topic) rec.topic = slugTopic(topic);
   const errs = validate(rec);
@@ -125,7 +125,7 @@ function applyEdit(file: string, ref: string, text: string, topic?: string): str
 
 function applyDelete(file: string, ref: string, reason?: string): string {
   const records = readStore(file);
-  if (!records.some((r) => r.id === ref && !r.op)) throw new Error(`no record ${ref}`);
+  if (!resolve(records).some((r) => r.id === ref)) throw new Error(`no record ${ref}`);
   const rec: StoreRecord = { op: "del", ref, ts: today() };
   if (reason) rec.reason = reason.slice(0, 120);
   fs.appendFileSync(file, JSON.stringify(rec) + "\n");
@@ -171,13 +171,17 @@ export function applyQueued(dir?: string, compactionId?: string, session?: strin
   if (pinned) {
     file = pinned;
     targetDir = path.dirname(pinned);
-  } else if (dir && fs.existsSync(path.join(dir, "AGENTS.jsonl"))) {
+  } else if (dir) {
+    // A directory handed to the applier is the store's home even before AGENTS.jsonl
+    // exists (the first apply creates it). Falling back to storePath() here would
+    // silently apply a different store and leave this one's queue untouched.
     targetDir = dir;
     file = path.join(dir, "AGENTS.jsonl");
   } else {
     file = storePath();
     targetDir = path.dirname(file);
   }
+  if (session === undefined) session = currentSessionId(targetDir);
   const claimed = claimPending(targetDir, compactionId || `comp_${Date.now()}`, session);
   if (!claimed.length) return "no queued memories";
   const results: string[] = [];
