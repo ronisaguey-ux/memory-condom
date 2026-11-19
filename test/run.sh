@@ -93,5 +93,7 @@ echo "$nobody" | grep -q "no queued memories" && ok "an unauthenticated apply ca
 owner=$(MEMCONDOM_FILE="$S" node "$BIN/memcondom-mcp.js" --apply-queued "$T" --session ses_owner)
 echo "$owner" | grep -q "appended" && ok "the queuing session applies its own queue" || bad "the queuing session applies its own queue"
 
+bash "$ROOT/test/seams.sh" || { echo "seam checks failed"; exit 1; }
+
 rm -rf "$T"
 [ "$fails" -eq 0 ] && { echo "all checks passed"; exit 0; } || { echo "$fails check(s) failed"; exit 1; }

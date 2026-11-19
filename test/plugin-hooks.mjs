@@ -16,6 +16,7 @@ const pending = (id, text) => ({
   op: 'add',
   target: 'plugin',
   text,
+  session: 'ses_test',
   created_at: new Date().toISOString(),
   applied_at: null,
   applied_compaction: null,
