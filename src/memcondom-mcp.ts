@@ -5,7 +5,9 @@
  * Exposes the append-only memory store and the artifact store as tools so an agent writes through a
  * schema-enforcing path instead of editing a prose file:
  *
- *   write_memory   append ONE terse verified fact at the bottom (prefix stays byte-identical)
+ *   write_memory   queue ONE terse verified fact; applied once, right after the next compaction
+ *   queue_memory   same thing under the explicit name (queue_edit / queue_delete for existing facts)
+ *   list_queued    inspect pending / applied queued changes; edit_queued / drop_queued adjust them
  *   edit_memory    correct a fact by appending an edit record (history preserved)
  *   delete_memory  forget a fact by appending a tombstone (history preserved)
  *   search_memory  ranked recall, so old facts need not be re-read every turn
@@ -26,8 +28,9 @@ import * as path from "path";
 
 import * as artifacts from "./artifacts.js";
 import { readStore, readArchive, resolve, validate, nextId, rank, LIMITS, slugTopic, type StoreRecord } from "./lib/store.js";
-import { renderTokens, budget } from "./lib/markdown.js";
+import { renderTokens, budget, renderMarkdown } from "./lib/markdown.js";
 import { checkAndUseEdit, LOCKED_MESSAGE } from "./lib/memory_window.js";
+import { claimPending, deleteFutureMemory, editFutureMemory, pendingFuture, readFuture, writeFutureMemory } from "./lib/future.js";
 
 /** Arguments an MCP client sends in `params.arguments`; every field is dynamic JSON. */
 export type ToolArgs = Record<string, unknown>;
@@ -89,17 +92,12 @@ function today(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-function writeMemory(args: ToolArgs): string {
-  const file = storePath();
-  const targetDir = path.dirname(file);
-  const sid = currentSessionId(targetDir);
-  const gate = checkAndUseEdit(targetDir, sid, file);
-  if (!gate.allowed) throw new Error(gate.message || LOCKED_MESSAGE);
+/**
+ * The direct-write logic, unchanged. It runs only from applyQueued(), once after a compaction.
+ */
+function applyAdd(file: string, text: string, topic: string): string {
   const records = readStore(file);
-  const text = String(args.text || "").replace(/\s+/g, " ").trim();
-  const rec: StoreRecord = { id: nextId(records), ts: today(), topic: slugTopic(args.topic), text };
-  if (Array.isArray(args.tags) && args.tags.length) rec.tags = args.tags.map(String).slice(0, 6);
-  if (Array.isArray(args.refs) && args.refs.length) rec.refs = args.refs.map(String).slice(0, 12);
+  const rec: StoreRecord = { id: nextId(records), ts: today(), topic: slugTopic(topic), text };
   const errs = validate(rec, new Set(records.map((r) => r.id as string)));
   if (errs.length) throw new Error(`refused: ${errs.join("; ")}`);
   const cap = budget();
@@ -107,49 +105,135 @@ function writeMemory(args: ToolArgs): string {
   const addition = Math.ceil((String(rec.text).length + String(rec.topic).length + 24) / 3.6);
   if (current + addition > cap)
     throw new Error(
-      `memory store is full: ~${current}/${cap} tokens. Either prune old memories ` +
-        `(memcondom prune --max-tokens ${cap} --file ${file}) or write this as an artifact with write_artifact. ` +
-        `Nothing was appended.`
+      `memory store is full: ~${current}/${cap} tokens. Prune old memories ` +
+        `(memcondom prune --max-tokens ${cap} --file ${file}) and keep the detail in an artifact.`
     );
   fs.appendFileSync(file, JSON.stringify(rec) + "\n");
-  return `appended ${rec.id} (${records.length + 1} lines, ~${current + addition}/${cap} tokens)`;
+  return `appended ${rec.id}`;
 }
 
-function editMemory(args: ToolArgs): string {
-  const file = storePath();
-  const targetDir = path.dirname(file);
-  const sid = currentSessionId(targetDir);
-  const gate = checkAndUseEdit(targetDir, sid, file);
-  if (!gate.allowed) throw new Error(gate.message || LOCKED_MESSAGE);
+function applyEdit(file: string, ref: string, text: string, topic?: string): string {
   const records = readStore(file);
-  const ref = String(args.id || args.ref || "");
   if (!records.some((r) => r.id === ref && !r.op)) throw new Error(`no record ${ref}`);
-  const rec: StoreRecord = {
-    op: "edit",
-    ref,
-    ts: today(),
-    text: String(args.text || "").replace(/\s+/g, " ").trim(),
-  };
-  if (args.topic) rec.topic = slugTopic(args.topic);
+  const rec: StoreRecord = { op: "edit", ref, ts: today(), text };
+  if (topic) rec.topic = slugTopic(topic);
   const errs = validate(rec);
   if (errs.length) throw new Error(`refused: ${errs.join("; ")}`);
   fs.appendFileSync(file, JSON.stringify(rec) + "\n");
-  return `edited ${ref} by appending a correction; the prefix before it is unchanged`;
+  return `edited ${ref}`;
+}
+
+function applyDelete(file: string, ref: string, reason?: string): string {
+  const records = readStore(file);
+  if (!records.some((r) => r.id === ref && !r.op)) throw new Error(`no record ${ref}`);
+  const rec: StoreRecord = { op: "del", ref, ts: today() };
+  if (reason) rec.reason = reason.slice(0, 120);
+  fs.appendFileSync(file, JSON.stringify(rec) + "\n");
+  return `deleted ${ref}`;
+}
+
+/** Queue one change. Nothing in the injected store moves until the next compaction. */
+function queueChange(op: "add" | "edit" | "delete", args: ToolArgs): string {
+  const dir = path.dirname(storePath());
+  const text = String(args.text || "").replace(/\s+/g, " ").trim();
+  if (op === "add") {
+    if (!text) throw new Error("text required");
+    const entry = writeFutureMemory(dir, "add", text, slugTopic(args.topic));
+    return `queued ${entry.id} (add: ${slugTopic(args.topic)}); applied once, right after the next compaction`;
+  }
+  const ref = String(args.id || args.ref || "").trim();
+  if (!ref) throw new Error("id required (the memory id to change)");
+  if (op === "edit" && !text) throw new Error("text required");
+  const entry = writeFutureMemory(dir, op, text, ref);
+  return `queued ${entry.id} (${op} ${ref}); applied once, right after the next compaction`;
+}
+
+function writeMemory(args: ToolArgs): string {
+  return queueChange("add", args);
+}
+
+function editMemory(args: ToolArgs): string {
+  return queueChange("edit", args);
 }
 
 function deleteMemory(args: ToolArgs): string {
-  const file = storePath();
-  const targetDir = path.dirname(file);
-  const sid = currentSessionId(targetDir);
-  const gate = checkAndUseEdit(targetDir, sid, file);
-  if (!gate.allowed) throw new Error(gate.message || LOCKED_MESSAGE);
-  const records = readStore(file);
-  const ref = String(args.id || args.ref || "");
-  if (!records.some((r) => r.id === ref && !r.op)) throw new Error(`no record ${ref}`);
-  const rec: StoreRecord = { op: "del", ref, ts: today() };
-  if (args.reason) rec.reason = String(args.reason).slice(0, 120);
-  fs.appendFileSync(file, JSON.stringify(rec) + "\n");
-  return `deleted ${ref} by appending a tombstone`;
+  return queueChange("delete", args);
+}
+
+/** Apply every pending entry in order, once, then freeze it until the next compaction. */
+export function applyQueued(dir?: string, compactionId?: string): string {
+  // The store can be pinned by MEMCONDOM_FILE (tests, unusual layouts), then by the
+  // directory the caller names, then by the default resolution order.
+  const pinned = process.env.MEMCONDOM_FILE;
+  let file: string;
+  let targetDir: string;
+  if (pinned) {
+    file = pinned;
+    targetDir = path.dirname(pinned);
+  } else if (dir && fs.existsSync(path.join(dir, "AGENTS.jsonl"))) {
+    targetDir = dir;
+    file = path.join(dir, "AGENTS.jsonl");
+  } else {
+    file = storePath();
+    targetDir = path.dirname(file);
+  }
+  const claimed = claimPending(targetDir, compactionId || `comp_${Date.now()}`);
+  if (!claimed.length) return "no queued memories";
+  const results: string[] = [];
+  for (const entry of claimed) {
+    try {
+      if (entry.op === "add") results.push(applyAdd(file, String(entry.text || ""), String(entry.target || "general")));
+      else if (entry.op === "edit") results.push(applyEdit(file, String(entry.target || ""), String(entry.text || "")));
+      else results.push(applyDelete(file, String(entry.target || ""), String(entry.text || "")));
+    } catch (error) {
+      results.push(`FAILED ${entry.id}: ${(error as Error).message}`);
+    }
+  }
+  try {
+    fs.writeFileSync(path.join(targetDir, "AGENTS.md"), renderMarkdown(file));
+  } catch (error) {
+    results.push(`render failed: ${(error as Error).message}`);
+  }
+  return `${claimed.length} queued memories applied\n${results.join("\n")}`;
+}
+
+function listQueued(args: ToolArgs): string {
+  const dir = path.dirname(storePath());
+  const all = readFuture(dir);
+  const rows = all.filter((entry) => (args.applied ? true : entry.applied_at === null));
+  if (!rows.length) return "(queue empty)";
+  return rows
+    .map((entry) =>
+      [
+        entry.id,
+        entry.op,
+        String(entry.target || ""),
+        entry.applied_at ? `applied ${entry.applied_at}` : "pending",
+        String(entry.text || "").slice(0, 120),
+      ].join("\t")
+    )
+    .join("\n");
+}
+
+function editQueued(args: ToolArgs): string {
+  const id = String(args.id || "").trim();
+  if (!id) throw new Error("id required");
+  const changes: Record<string, string> = {};
+  if (args.text !== undefined) changes.text = String(args.text).replace(/\s+/g, " ").trim();
+  if (args.target !== undefined) changes.target = String(args.target).trim();
+  if (args.op !== undefined) {
+    const op = String(args.op);
+    if (op !== "add" && op !== "edit" && op !== "delete") throw new Error("op must be add, edit or delete");
+    changes.op = op;
+  }
+  const entry = editFutureMemory(path.dirname(storePath()), id, changes);
+  return `updated ${entry.id} (${entry.op}); still pending until the next compaction`;
+}
+
+function dropQueued(args: ToolArgs): string {
+  const id = String(args.id || "").trim();
+  if (!id) throw new Error("id required");
+  return deleteFutureMemory(path.dirname(storePath()), id) ? `dropped ${id}` : `no queued entry ${id}`;
 }
 
 function listMemories(args: ToolArgs): string {
@@ -240,6 +324,83 @@ const TOOLS: ToolDefinition[] = [
     },
   },
   {
+    name: "queue_memory",
+    description:
+      "Remember ONE terse verified fact. The change is QUEUED and applied to the injected store exactly once, right after the next compaction - injected memory never changes mid-turn, so the provider prompt prefix stays warm. Use write_memory as the alias.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "One fact, max 400 chars, no newlines" },
+        topic: { type: "string", description: "Lowercase slug: router, helpotron/deploy, browsers" },
+      },
+      required: ["text"],
+    },
+  },
+  {
+    name: "queue_edit",
+    description:
+      "Queue a correction to an EXISTING memory (by id) - for a fact you discover is wrong mid-session. Applied once, right after the next compaction.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Memory id to correct, e.g. m0014" },
+        text: { type: "string", description: "Replacement fact" },
+        topic: { type: "string" },
+      },
+      required: ["id", "text"],
+    },
+  },
+  {
+    name: "queue_delete",
+    description:
+      "Queue the removal of an EXISTING memory (by id) you discover is wrong or stale mid-session. Applied once, right after the next compaction.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Memory id to remove" },
+        reason: { type: "string", description: "Why it is wrong" },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "list_queued",
+    description: "Inspect queued memory changes. Pending by default; pass applied:true to see the ones already applied and frozen.",
+    inputSchema: {
+      type: "object",
+      properties: { applied: { type: "boolean", description: "Include applied entries" } },
+    },
+  },
+  {
+    name: "edit_queued",
+    description: "Rewrite a still-pending queued change (text, target id, or op) before it is applied. Applied entries are frozen until the next compaction.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Queued entry id, e.g. fm_..." },
+        text: { type: "string" },
+        target: { type: "string" },
+        op: { type: "string", description: "add | edit | delete" },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "drop_queued",
+    description: "Discard a queued change so it never reaches the store.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+    },
+  },
+  {
+    name: "apply_queued",
+    description:
+      "Apply every pending queued change now and freeze it. Runs automatically right after a compaction; call it by hand only to repair a session where that event was missed.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
     name: "list_memories",
     description: "Recent memories, newest last, optionally filtered by topic. Read-only.",
     inputSchema: {
@@ -319,6 +480,13 @@ const HANDLERS: Record<string, ToolHandler> = {
   write_memory: (a) => writeMemory(a),
   edit_memory: (a) => editMemory(a),
   delete_memory: (a) => deleteMemory(a),
+  queue_memory: (a) => queueChange("add", a),
+  queue_edit: (a) => queueChange("edit", a),
+  queue_delete: (a) => queueChange("delete", a),
+  list_queued: (a) => listQueued(a),
+  edit_queued: (a) => editQueued(a),
+  drop_queued: (a) => dropQueued(a),
+  apply_queued: () => applyQueued(),
   list_memories: (a) => listMemories(a),
   search_memory: (a) => searchMemory(a),
   memory_stats: () => memoryStats(),
@@ -338,6 +506,18 @@ function reply(id: string | number | undefined, result: unknown): void {
 }
 function fail(id: string | number | undefined, message: string): void {
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message } }) + "\n");
+}
+
+const applyFlag = process.argv.indexOf("--apply-queued");
+if (applyFlag >= 0) {
+  const dir = process.argv[applyFlag + 1];
+  try {
+    process.stdout.write(applyQueued(dir ? path.resolve(dir) : undefined) + "\n");
+  } catch (error) {
+    process.stderr.write((error as Error).message + "\n");
+    process.exit(1);
+  }
+  process.exit(0);
 }
 
 let buffer = "";
