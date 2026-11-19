@@ -48,20 +48,20 @@ M="$T/mcp.jsonl"
 queued=$(printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_memory","arguments":{"text":"queued fact","topic":"mcp"}}}' \
-  | MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js")
+  | OPENCODE_SESSION_ID=ses_test MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js")
 echo "$queued" | grep -q "queued fm_" && ok "write_memory queues instead of writing" || bad "write_memory queues instead of writing"
 [ -s "$M" ] && bad "queued write must not touch the store yet" || ok "queued write must not touch the store yet"
 
-applied=$(MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" --apply-queued "$T")
+applied=$(MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" --apply-queued "$T" --session ses_test)
 echo "$applied" | grep -q "appended" && ok "apply_queued lands the fact" || bad "apply_queued lands the fact"
 grep -q "queued fact" "$M" && ok "store holds the fact after apply" || bad "store holds the fact after apply"
-MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" --apply-queued "$T" | grep -q "no queued memories" \
+MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" --apply-queued "$T" --session ses_test | grep -q "no queued memories" \
   && ok "applied entries never apply twice" || bad "applied entries never apply twice"
 
 read_back=$(printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_memories","arguments":{"limit":5}}}' \
-  | MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js")
+  | OPENCODE_SESSION_ID=ses_test MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js")
 echo "$read_back" | grep -q "queued fact" && ok "applied fact is readable" || bad "applied fact is readable"
 
 first=$(python3 -c "import json;print(json.loads(open('$M').readline())['id'])")
@@ -69,14 +69,14 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
   "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"queue_edit\",\"arguments\":{\"id\":\"$first\",\"text\":\"corrected after review\"}}}" \
   "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"queue_delete\",\"arguments\":{\"id\":\"$first\",\"reason\":\"superseded\"}}}" \
-  | MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" >/dev/null
-MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" --apply-queued "$T" | grep -q "edited $first" \
+  | OPENCODE_SESSION_ID=ses_test MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" >/dev/null
+MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" --apply-queued "$T" --session ses_test | grep -q "edited $first" \
   && ok "queue_edit applies an existing fact" || bad "queue_edit applies an existing fact"
-MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" --apply-queued "$T" | grep -q "no queued memories" \
+MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" --apply-queued "$T" --session ses_test | grep -q "no queued memories" \
   && ok "queue_delete applied in the same batch" || bad "queue_delete applied in the same batch"
 grep -q "corrected after review" "$M" && ok "correction reached the store" || bad "correction reached the store"
 
-frozen=$(MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" --apply-queued "$T")
+frozen=$(MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" --apply-queued "$T" --session ses_test)
 echo "$frozen" | grep -q "no queued memories" && ok "queue is empty and frozen" || bad "queue is empty and frozen"
 
 S="$T/scope"
@@ -88,6 +88,8 @@ printf '%s\n' \
 other=$(MEMCONDOM_FILE="$S" node "$BIN/memcondom-mcp.js" --apply-queued "$T" --session ses_other)
 echo "$other" | grep -q "no queued memories" && ok "another session cannot consume the queue" || bad "another session cannot consume the queue"
 [ -s "$S" ] && bad "queue must stay unapplied" || ok "queue must stay unapplied"
+nobody=$(MEMCONDOM_FILE="$S" node "$BIN/memcondom-mcp.js" --apply-queued "$T")
+echo "$nobody" | grep -q "no queued memories" && ok "an unauthenticated apply cannot consume the queue" || bad "an unauthenticated apply cannot consume the queue"
 owner=$(MEMCONDOM_FILE="$S" node "$BIN/memcondom-mcp.js" --apply-queued "$T" --session ses_owner)
 echo "$owner" | grep -q "appended" && ok "the queuing session applies its own queue" || bad "the queuing session applies its own queue"
 
