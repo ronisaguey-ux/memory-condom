@@ -128,7 +128,10 @@ function claimPending(targetDir, compactionId, session) {
     // A queued change belongs to the session that wrote it. Another session compacting in
     // the same store must not consume it - that is how one agent's test fact landed in
     // Gideon's memory while Gideon had not compacted.
-    const claimed = entries.filter((entry) => entry.applied_at === null && (!session || !entry.session || entry.session === session));
+    // Strict: an entry is consumed only by the session that queued it. An entry with no
+    // recorded session (written by an older build) is never auto-applied - it waits for an
+    // explicit apply_queued, so a stray compaction cannot dump it into injected memory.
+    const claimed = entries.filter((entry) => entry.applied_at === null && Boolean(session) && entry.session === session);
     if (!claimed.length)
         return [];
     const now = new Date().toISOString();
