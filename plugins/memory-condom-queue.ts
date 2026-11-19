@@ -68,6 +68,31 @@ function applyQueue(workspace: string | undefined, reason: string): void {
   }
 }
 
+/**
+ * Install the queued system prompt. Only ever called from the post-compaction path,
+ * so the replacement lands after a compaction and never mid-turn.
+ */
+function installNextPrompt(reason: string): void {
+  // Installs the queued prompt AND restarts the OpenCode service, because a running
+  // session reads its prompt from configuration: without the restart the swap is invisible.
+  const installer = join(homedir(), ".local/bin/after-compaction-swap");
+  if (!existsSync(installer)) return;
+  try {
+    const child = spawn(installer, ["--after-compaction"], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    child.stdout?.on("data", (chunk) => {
+      out += String(chunk).slice(0, 400);
+    });
+    child.stderr?.on("data", (chunk) => {
+      out += String(chunk).slice(0, 200);
+    });
+    child.on("exit", (code) => log(`prompt(${reason}) code=${code} ${out.trim()}`));
+    child.unref();
+  } catch (error) {
+    log(`prompt(${reason}) failed: ${(error as Error).message}`);
+  }
+}
+
 function isMemoryFile(filePath: string): boolean {
   if (!filePath || typeof filePath !== "string") return false;
   const norm = filePath.replace(/\\/g, "/");
@@ -119,6 +144,7 @@ async function registerPlugin(ctx: PluginCtx): Promise<() => void> {
             }
             log(`compacted event session=${sid || "?"} workspace=${dir || home || "?"}`);
             applyQueue(dir || home, "compacted-event");
+            installNextPrompt("compacted-event");
           }
         } catch (error) {
           log(`event stream ended: ${(error as Error).message}`);
