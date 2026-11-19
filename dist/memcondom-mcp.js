@@ -140,11 +140,12 @@ function applyDelete(file, ref, reason) {
 /** Queue one change. Nothing in the injected store moves until the next compaction. */
 function queueChange(op, args) {
     const dir = path.dirname(storePath());
+    const session = currentSessionId(dir);
     const text = String(args.text || "").replace(/\s+/g, " ").trim();
     if (op === "add") {
         if (!text)
             throw new Error("text required");
-        const entry = (0, future_js_1.writeFutureMemory)(dir, "add", text, (0, store_js_1.slugTopic)(args.topic));
+        const entry = (0, future_js_1.writeFutureMemory)(dir, "add", text, (0, store_js_1.slugTopic)(args.topic), session);
         return `queued ${entry.id} (add: ${(0, store_js_1.slugTopic)(args.topic)}); applied once, right after the next compaction`;
     }
     const ref = String(args.id || args.ref || "").trim();
@@ -152,7 +153,7 @@ function queueChange(op, args) {
         throw new Error("id required (the memory id to change)");
     if (op === "edit" && !text)
         throw new Error("text required");
-    const entry = (0, future_js_1.writeFutureMemory)(dir, op, text, ref);
+    const entry = (0, future_js_1.writeFutureMemory)(dir, op, text, ref, session);
     return `queued ${entry.id} (${op} ${ref}); applied once, right after the next compaction`;
 }
 function writeMemory(args) {
@@ -165,7 +166,7 @@ function deleteMemory(args) {
     return queueChange("delete", args);
 }
 /** Apply every pending entry in order, once, then freeze it until the next compaction. */
-function applyQueued(dir, compactionId) {
+function applyQueued(dir, compactionId, session) {
     // The store can be pinned by MEMCONDOM_FILE (tests, unusual layouts), then by the
     // directory the caller names, then by the default resolution order.
     const pinned = process.env.MEMCONDOM_FILE;
@@ -183,7 +184,7 @@ function applyQueued(dir, compactionId) {
         file = storePath();
         targetDir = path.dirname(file);
     }
-    const claimed = (0, future_js_1.claimPending)(targetDir, compactionId || `comp_${Date.now()}`);
+    const claimed = (0, future_js_1.claimPending)(targetDir, compactionId || `comp_${Date.now()}`, session);
     if (!claimed.length)
         return "no queued memories";
     const results = [];
@@ -506,8 +507,10 @@ function fail(id, message) {
 const applyFlag = process.argv.indexOf("--apply-queued");
 if (applyFlag >= 0) {
     const dir = process.argv[applyFlag + 1];
+    const sessionFlag = process.argv.indexOf("--session");
+    const session = sessionFlag >= 0 ? process.argv[sessionFlag + 1] : undefined;
     try {
-        process.stdout.write(applyQueued(dir ? path.resolve(dir) : undefined) + "\n");
+        process.stdout.write(applyQueued(dir ? path.resolve(dir) : undefined, undefined, session) + "\n");
     }
     catch (error) {
         process.stderr.write(error.message + "\n");
