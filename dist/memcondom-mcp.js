@@ -116,7 +116,7 @@ function applyAdd(file, text, topic) {
 }
 function applyEdit(file, ref, text, topic) {
     const records = (0, store_js_1.readStore)(file);
-    if (!records.some((r) => r.id === ref && !r.op))
+    if (!(0, store_js_1.resolve)(records).some((r) => r.id === ref))
         throw new Error(`no record ${ref}`);
     const rec = { op: "edit", ref, ts: today(), text };
     if (topic)
@@ -129,7 +129,7 @@ function applyEdit(file, ref, text, topic) {
 }
 function applyDelete(file, ref, reason) {
     const records = (0, store_js_1.readStore)(file);
-    if (!records.some((r) => r.id === ref && !r.op))
+    if (!(0, store_js_1.resolve)(records).some((r) => r.id === ref))
         throw new Error(`no record ${ref}`);
     const rec = { op: "del", ref, ts: today() };
     if (reason)
@@ -176,7 +176,10 @@ function applyQueued(dir, compactionId, session) {
         file = pinned;
         targetDir = path.dirname(pinned);
     }
-    else if (dir && fs.existsSync(path.join(dir, "AGENTS.jsonl"))) {
+    else if (dir) {
+        // A directory handed to the applier is the store's home even before AGENTS.jsonl
+        // exists (the first apply creates it). Falling back to storePath() here would
+        // silently apply a different store and leave this one's queue untouched.
         targetDir = dir;
         file = path.join(dir, "AGENTS.jsonl");
     }
@@ -184,6 +187,8 @@ function applyQueued(dir, compactionId, session) {
         file = storePath();
         targetDir = path.dirname(file);
     }
+    if (session === undefined)
+        session = currentSessionId(targetDir);
     const claimed = (0, future_js_1.claimPending)(targetDir, compactionId || `comp_${Date.now()}`, session);
     if (!claimed.length)
         return "no queued memories";

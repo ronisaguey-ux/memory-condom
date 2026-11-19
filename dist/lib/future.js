@@ -78,7 +78,7 @@ function writeFuture(targetDir, entries) {
     fs.renameSync(tmp, file);
 }
 function pendingFuture(targetDir) {
-    return readFuture(targetDir).filter((entry) => entry.applied_at === null);
+    return readFuture(targetDir).filter((entry) => entry.applied_at == null);
 }
 function writeFutureMemory(targetDir, op, text, target, session) {
     if (op === "add" && !text)
@@ -106,7 +106,7 @@ function editFutureMemory(targetDir, id, changes) {
     const entry = entries.find((candidate) => candidate.id === id);
     if (!entry)
         throw new Error(`no future memory ${id}`);
-    if (entry.applied_at !== null) {
+    if (entry.applied_at != null) {
         throw new Error(`future memory ${id} was applied at ${entry.applied_at}; it is frozen until the next compaction`);
     }
     Object.assign(entry, changes);
@@ -131,7 +131,7 @@ function claimPending(targetDir, compactionId, session) {
     // Strict: an entry is consumed only by the session that queued it. An entry with no
     // recorded session (written by an older build) is never auto-applied - it waits for an
     // explicit apply_queued, so a stray compaction cannot dump it into injected memory.
-    const claimed = entries.filter((entry) => entry.applied_at === null && Boolean(session) && entry.session === session);
+    const claimed = entries.filter((entry) => entry.applied_at == null && Boolean(session) && entry.session === session);
     if (!claimed.length)
         return [];
     const now = new Date().toISOString();
