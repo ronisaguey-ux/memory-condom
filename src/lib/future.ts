@@ -25,6 +25,8 @@ export interface FutureMemory {
   /** add: the fact text. edit/delete: the id or the text of the memory to change. */
   target?: string;
   text?: string;
+  /** Session that queued this change. Only that session's compaction may apply it. */
+  session?: string;
   created_at: string;
   applied_at: string | null;
   applied_compaction: string | null;
@@ -61,6 +63,7 @@ export function writeFutureMemory(
   op: FutureOp,
   text: string | undefined,
   target: string | undefined,
+  session?: string,
 ): FutureMemory {
   if (op === "add" && !text) throw new Error("write_fm add needs text");
   if ((op === "edit" || op === "delete") && !target) throw new Error(`write_fm ${op} needs a target (id or text)`);
@@ -70,6 +73,7 @@ export function writeFutureMemory(
     op,
     target,
     text,
+    session,
     created_at: new Date().toISOString(),
     applied_at: null,
     applied_compaction: null,
@@ -107,9 +111,18 @@ export function deleteFutureMemory(targetDir: string | undefined, id: string): b
  * Stamp every pending entry as applied to `compactionId` and hand the list back.
  * The caller performs the store writes: this module never touches AGENTS.jsonl.
  */
-export function claimPending(targetDir: string | undefined, compactionId: string): FutureMemory[] {
+export function claimPending(
+  targetDir: string | undefined,
+  compactionId: string,
+  session?: string,
+): FutureMemory[] {
   const entries = readFuture(targetDir);
-  const claimed = entries.filter((entry) => entry.applied_at === null);
+  // A queued change belongs to the session that wrote it. Another session compacting in
+  // the same store must not consume it - that is how one agent's test fact landed in
+  // Gideon's memory while Gideon had not compacted.
+  const claimed = entries.filter(
+    (entry) => entry.applied_at === null && (!session || !entry.session || entry.session === session),
+  );
   if (!claimed.length) return [];
   const now = new Date().toISOString();
   for (const entry of claimed) {

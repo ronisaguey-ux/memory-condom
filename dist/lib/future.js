@@ -80,7 +80,7 @@ function writeFuture(targetDir, entries) {
 function pendingFuture(targetDir) {
     return readFuture(targetDir).filter((entry) => entry.applied_at === null);
 }
-function writeFutureMemory(targetDir, op, text, target) {
+function writeFutureMemory(targetDir, op, text, target, session) {
     if (op === "add" && !text)
         throw new Error("write_fm add needs text");
     if ((op === "edit" || op === "delete") && !target)
@@ -91,6 +91,7 @@ function writeFutureMemory(targetDir, op, text, target) {
         op,
         target,
         text,
+        session,
         created_at: new Date().toISOString(),
         applied_at: null,
         applied_compaction: null,
@@ -122,9 +123,12 @@ function deleteFutureMemory(targetDir, id) {
  * Stamp every pending entry as applied to `compactionId` and hand the list back.
  * The caller performs the store writes: this module never touches AGENTS.jsonl.
  */
-function claimPending(targetDir, compactionId) {
+function claimPending(targetDir, compactionId, session) {
     const entries = readFuture(targetDir);
-    const claimed = entries.filter((entry) => entry.applied_at === null);
+    // A queued change belongs to the session that wrote it. Another session compacting in
+    // the same store must not consume it - that is how one agent's test fact landed in
+    // Gideon's memory while Gideon had not compacted.
+    const claimed = entries.filter((entry) => entry.applied_at === null && (!session || !entry.session || entry.session === session));
     if (!claimed.length)
         return [];
     const now = new Date().toISOString();
