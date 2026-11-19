@@ -42,29 +42,42 @@ echo "$out" | grep -q "body text" && ok "artifact write + read" || bad "artifact
 echo "$out" | grep -q "2026-" && ok "artifact is timestamp-named" || bad "artifact is timestamp-named"
 
 M="$T/mcp.jsonl"
-# Without a post-compaction window the store is locked: a write must be refused, not silently
-# accepted. This is the gate the agents actually hit, so it is tested first.
-locked=$(printf '%s\n' \
+: > "$M"
+# Owner (2026-11-19): there is no edit window. A write is QUEUED at any moment and lands
+# exactly once, after a compaction, so injected memory never changes mid-turn.
+queued=$(printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_memory","arguments":{"text":"locked fact","topic":"mcp"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_memory","arguments":{"text":"queued fact","topic":"mcp"}}}' \
   | MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js")
-echo "$locked" | grep -q "MEMORY_LOCKED" && ok "memory write refused without a compaction window" || bad "memory write refused without a compaction window"
+echo "$queued" | grep -q "queued fm_" && ok "write_memory queues instead of writing" || bad "write_memory queues instead of writing"
+[ -s "$M" ] && bad "queued write must not touch the store yet" || ok "queued write must not touch the store yet"
 
-# Open the 80-turn window the way a compaction event does, then the same write must land.
-node -e "require('$ROOT/bin/lib/memory_window.js').onCompaction('$T','ses_test','c_test')" >/dev/null 2>&1
-out=$(printf '%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_memory","arguments":{"text":"mcp fact","topic":"mcp"}}}' \
-  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_memories","arguments":{"limit":5}}}' \
-  | MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js")
-echo "$out" | grep -q "mcp fact" && ok "MCP add + read inside the window" || bad "MCP add + read inside the window"
+applied=$(MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" --apply-queued "$T")
+echo "$applied" | grep -q "appended" && ok "apply_queued lands the fact" || bad "apply_queued lands the fact"
+grep -q "queued fact" "$M" && ok "store holds the fact after apply" || bad "store holds the fact after apply"
+MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" --apply-queued "$T" | grep -q "no queued memories" \
+  && ok "applied entries never apply twice" || bad "applied entries never apply twice"
 
-# The window is a turn budget, not a single edit: a second write in the same window must work.
-second=$(printf '%s\n' \
+read_back=$(printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_memory","arguments":{"text":"second fact","topic":"mcp"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_memories","arguments":{"limit":5}}}' \
   | MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js")
-echo "$second" | grep -q "second fact\|ok" && ok "second write allowed inside the same window" || bad "second write allowed inside the same window"
+echo "$read_back" | grep -q "queued fact" && ok "applied fact is readable" || bad "applied fact is readable"
+
+first=$(python3 -c "import json;print(json.loads(open('$M').readline())['id'])")
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"queue_edit\",\"arguments\":{\"id\":\"$first\",\"text\":\"corrected after review\"}}}" \
+  "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"queue_delete\",\"arguments\":{\"id\":\"$first\",\"reason\":\"superseded\"}}}" \
+  | MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" >/dev/null
+MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" --apply-queued "$T" | grep -q "edited $first" \
+  && ok "queue_edit applies an existing fact" || bad "queue_edit applies an existing fact"
+MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" --apply-queued "$T" | grep -q "no queued memories" \
+  && ok "queue_delete applied in the same batch" || bad "queue_delete applied in the same batch"
+grep -q "corrected after review" "$M" && ok "correction reached the store" || bad "correction reached the store"
+
+frozen=$(MEMCONDOM_FILE="$M" node "$BIN/memcondom-mcp.js" --apply-queued "$T")
+echo "$frozen" | grep -q "no queued memories" && ok "queue is empty and frozen" || bad "queue is empty and frozen"
 
 rm -rf "$T"
 [ "$fails" -eq 0 ] && { echo "all checks passed"; exit 0; } || { echo "$fails check(s) failed"; exit 1; }
